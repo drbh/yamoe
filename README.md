@@ -25,6 +25,16 @@ oooo    ooo  .oooo.   ooo. .oo.  .oo.    .ooooo.   .ooooo.
 - low memory usage: optimized to handle large batch sizes
 - reproducibility: easy to reproduce results, no special new `sm` requirements
 
+### Performance
+
+`yamoe` scales well as batch sizes increase in comparision to the naive method of repeating the data and computation for every item in the batch as shown in the reference in [torch-ext/yamoe/reference.py](torch-ext/yamoe/reference.py). This bench can be reproduced by running `uv run perf_plot.py` or a smaller bench and correctness comparision can be run with `uv run compare_example.py`
+
+
+TLDR: smaller is better on the first two rows of charts
+
+<img width="3583" height="2358" alt="moe_performance_comparison" src="https://github.com/user-attachments/assets/72938f64-ec05-4eaa-82c4-507a43891543" />
+
+
 
 ### How to use
 
