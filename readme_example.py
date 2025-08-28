@@ -1,34 +1,3 @@
----
-license: mit
-tags:
-  - kernel
----
-
-``` 
-                                                            
-oooo    ooo  .oooo.   ooo. .oo.  .oo.    .ooooo.   .ooooo.  
- `88.  .8'  `P  )88b  `888P"Y88bP"Y88b  d88' `88b d88' `88b 
-  `88..8'    .oP"888   888   888   888  888   888 888ooo888 
-   `888'    d8(  888   888   888   888  888   888 888    .o 
-    .8'     `Y888""8o o888o o888o o888o `Y8bod8P' `Y8bod8P' 
-.o..P'                                                      
-`Y8P'                                                       
-
-                Yet Another Mixture of Experts 
-```
-
-`yamoe` is a no nonsense, straightforward implementation of Mixture of Experts (MoE) kernels, designed to be super easy to use and be very computationally efficient.
-
-### Design goals
-- simplicity: easy to read and understand the code
-- efficiency: optimized for high throughput and low latency
-- low memory usage: optimized to handle large batch sizes
-- reproducibility: easy to reproduce results, no special new `sm` requirements
-
-
-### How to use
-
-```python
 # /// script
 # requires-python = "==3.10"
 # dependencies = ["torch==2.7.0", "triton", "numpy", "kernels"]
@@ -117,4 +86,3 @@ peak_mem_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
 print(f"Output: sum={output.sum().item():.1f}, min={output.min().item():.1f}, max={output.max().item():.1f}")
 print(f"First 3: {output.view(-1)[:3].tolist()}")
 print(f"Time: {elapsed_ms:.1f}ms, Memory: {peak_mem_mb:.0f}MB")
-```
