@@ -130,6 +130,10 @@ model.down_proj_bias.data = down_proj_bias
 model = model.cuda()
 model.eval()
 
+# Warmup
+for _ in range(5):
+    _ = model(hidden_states, router_indices, routing_weights)
+
 torch.cuda.synchronize()
 torch.cuda.reset_peak_memory_stats()
 start = time.perf_counter()
@@ -150,6 +154,19 @@ ref_output_reshaped = ref_output.view(kernel_output.shape)
 
 # Test yamoe_ref implementation
 expert_capacity = batch_seq * top_k // num_experts * 2  # Generous capacity
+
+# Warmup
+for _ in range(5):
+    _ = binned_experts_ref(
+        hidden_states,
+        router_indices,
+        routing_weights,
+        gate_up_proj,
+        gate_up_proj_bias,
+        down_proj,
+        down_proj_bias,
+        expert_capacity,
+    )
 
 torch.cuda.synchronize()
 torch.cuda.reset_peak_memory_stats()
