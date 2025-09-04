@@ -24,6 +24,16 @@ oooo    ooo  .oooo.   ooo. .oo.  .oo.    .ooooo.   .ooooo.
 - efficiency: optimized for high throughput and low latency
 - low memory usage: optimized to handle large batch sizes
 - reproducibility: easy to reproduce results, no special new `sm` requirements
+- availability: easy to install and use via the [kernels](https://github.com/huggingface/kernels) library
+
+### Kernel Hub
+
+You can find the kernel on [Kernel Hub](https://huggingface.co/drbh/yamoe) and install it via the [kernels](https://github.com/huggingface/kernels) library.
+
+```python
+from kernels import get_kernel
+yamoe = get_kernel("drbh/yamoe", revision="v0.2.0")
+```
 
 ### Performance
 
