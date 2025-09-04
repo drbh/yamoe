@@ -7,8 +7,7 @@
 
 import time
 import torch
-from kernels import get_local_kernel
-from kernels import get_kernel
+from kernels import get_kernel, get_local_kernel
 from pathlib import Path
 from torch.nn import functional as F
 
@@ -83,6 +82,8 @@ torch.cuda.synchronize()
 elapsed_ms = (time.perf_counter() - start) * 1e3
 peak_mem_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
 
-print(f"Output: sum={output.sum().item():.1f}, min={output.min().item():.1f}, max={output.max().item():.1f}")
+print(
+    f"Output: sum={output.sum().item():.1f}, min={output.min().item():.1f}, max={output.max().item():.1f}"
+)
 print(f"First 3: {output.view(-1)[:3].tolist()}")
 print(f"Time: {elapsed_ms:.1f}ms, Memory: {peak_mem_mb:.0f}MB")

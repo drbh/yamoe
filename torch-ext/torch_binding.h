@@ -53,3 +53,19 @@ torch::Tensor experts_cuda(
     int64_t num_experts,             // E - number of experts
     int64_t top_k                    // K - top-k routing
 );
+
+std::vector<torch::Tensor> experts_backward_cuda(
+    const torch::Tensor &grad_out,        // [T, H] - gradient from output
+    const torch::Tensor &hidden_states,   // [T, H] - original input
+    const torch::Tensor &router_indices,  // [T, K] - expert indices per token
+    const torch::Tensor &routing_weights, // [T, K] or [T, E] - routing weights
+    const torch::Tensor
+        &gate_up_proj, // [E, H, 2*H] - gate/up projection weights
+    const torch::Tensor
+        &gate_up_proj_bias,              // [E, 2*H] - gate/up projection bias
+    const torch::Tensor &down_proj,      // [E, H, H] - down projection weights
+    const torch::Tensor &down_proj_bias, // [E, H] - down projection bias
+    int64_t expert_capacity,             // C - capacity per expert
+    int64_t num_experts,                 // E - number of experts
+    int64_t top_k                        // K - top-k routing
+);

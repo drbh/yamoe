@@ -13,3 +13,7 @@ torch-ext/registration.h
 torch-ext/yamoe/_ops.py
 csrc/batch_mm.cu
 torch-ext/yamoe/*.abi3.so
+
+build-ext
+build
+exploration
