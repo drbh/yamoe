@@ -49,8 +49,15 @@ def main():
     ref_moe_cls = yamoe.vendored.gpt_oss_mlp.GptOssMLP
     new_moe_cls = yamoe.Yamoe
 
-    batch_size, seq_len, hidden_dim = 4, 1024, 2880
-    num_experts, top_k = 8, 2
+    batch_size, seq_len, hidden_dim = 1, 1024, 2880
+    num_experts, top_k = 32, 4
+
+    print("\nInput parameters:")
+    print(f" Batch size: {batch_size}")
+    print(f" Seq len: {seq_len}")
+    print(f" Hidden dim: {hidden_dim}")
+    print(f" Num experts: {num_experts}")
+    print(f" Top-k: {top_k}")
 
     config = type("Config", (), {})()
     config.hidden_size = hidden_dim
@@ -59,6 +66,7 @@ def main():
     config.num_experts_per_tok = top_k
     ref_moe = ref_moe_cls(config)
 
+    print("\nModel:")
     print(ref_moe)
 
     for p in ref_moe.parameters():
@@ -91,8 +99,8 @@ def main():
 
     benchmark_forward(ref_moe, x, tag="reference", warmup=10, iters=20)
 
-    # Switch to YAMOE-backed forward
-    print("\nYAMOE-backed Implementation")
+    # Switch to YAMOE forward
+    print("\nYAMOE Implementation")
     ref_moe.forward = new_moe_cls.forward.__get__(ref_moe)
     ref_moe._routing_weights_buffer = None
     ref_moe._batch_indices_buffer = None
@@ -117,7 +125,7 @@ def main():
         f" Output mean: {out.mean():.6f}, std: {out.std():.6f}, norm: {out.norm():.6f}"
     )
 
-    benchmark_forward(ref_moe, x, tag="yamoe-backed", warmup=10, iters=20)
+    benchmark_forward(ref_moe, x, tag="yamoe", warmup=10, iters=20)
 
 
 if __name__ == "__main__":
