@@ -30,7 +30,7 @@ if load_method == 1:
 elif load_method == 2:
     yamoe = get_local_kernel(Path("result"), "yamoe")
 elif load_method == 3:
-    yamoe = get_kernel("drbh/yamoe", revision="v0.1.0")
+    yamoe = get_kernel("drbh/yamoe", revision="v0.2.0")
 
 binned_experts_ref = yamoe.vendored.yamoe_ref.binned_experts_ref
 GptOssExperts = yamoe.vendored.gpt_oss_mlp.GptOssExperts

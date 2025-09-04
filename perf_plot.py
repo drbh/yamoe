@@ -19,7 +19,7 @@ import numpy as np
 # import yamoe
 # import yamoe.reference as reference
 
-yamoe = get_kernel("drbh/yamoe", revision="v0.1.0")
+yamoe = get_kernel("drbh/yamoe", revision="v0.2.0")
 reference = yamoe.reference
 
 # Setup

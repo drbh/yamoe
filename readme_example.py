@@ -18,7 +18,7 @@ torch.cuda.manual_seed_all(42)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
-yamoe = get_kernel("drbh/yamoe", revision="v0.1.0")
+yamoe = get_kernel("drbh/yamoe", revision="v0.2.0")
 
 # Configuration
 batch_size, seq_len, hidden_dim = 16, 256, 2880
