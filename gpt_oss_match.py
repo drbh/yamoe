@@ -11,7 +11,7 @@ import time
 from kernels import get_kernel, get_local_kernel
 from pathlib import Path
 
-load_method = 2  # 1: sym, 2: local, 3: hf
+load_method = 3 # 1: sym, 2: local, 3: hf
 
 if load_method == 1:
     sys.path.insert(0, "./torch-ext")

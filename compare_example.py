@@ -22,7 +22,7 @@ torch.backends.cudnn.benchmark = False
 
 np.set_printoptions(precision=4)
 
-load_method = 2  # 1: sym, 2: local, 3: hf
+load_method = 3  # 1: sym, 2: local, 3: hf
 
 if load_method == 1:
     sys.path.insert(0, "./torch-ext")
