@@ -100,35 +100,21 @@ class _ExpertsFn(torch.autograd.Function):
         )
 
 
+def ceil_div(a, b):
+    return (a + b - 1) // b
+
 class Yamoe(torch.nn.Module):
     can_torch_compile: bool = False
 
-    _routing_weights_buffer: torch.Tensor = None
-    _batch_indices_buffer: torch.Tensor = None
-    _last_batch_seq: int = None
-    _last_num_experts: int = None
-    enable_router_grads: bool = True
-
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        # Initialize runtime attrs when this forward is bound onto a different module (e.g., GptOssMLP)
-        if not hasattr(self, "enable_router_grads"):
-            # self.enable_router_grads = True
-            self.enable_router_grads = False
-        if not hasattr(self, "_routing_weights_buffer"):
-            self._routing_weights_buffer = None
-            self._batch_indices_buffer = None
-            self._last_batch_seq = None
-            self._last_num_experts = None
-            self._timing_enabled = False
-            self._timing_stats = {}
+        self.enable_router_grads = False
+        self._timing_stats = {}
 
         batch_size, seq_len, hidden_dim = hidden_states.shape
         batch_seq = batch_size * seq_len
 
-        num_experts = getattr(self, "num_experts", 128)
+        num_experts = getattr(self, "num_experts", 32)
         top_k = getattr(self, "top_k", 4)
-
-        # Enable timing if requested
         timing = getattr(self, "_timing_enabled", False)
 
         if timing:
@@ -173,7 +159,7 @@ class Yamoe(torch.nn.Module):
         gate_up = self.experts.gate_up_proj[:, :, : 2 * hidden_dim].contiguous()
         gate_up_bias = self.experts.gate_up_proj_bias[:, : 2 * hidden_dim].contiguous()
         down_proj = self.experts.down_proj[:, :hidden_dim, :].contiguous()
-        expert_capacity = batch_seq * top_k // num_experts * 2
+        expert_capacity = ceil_div(batch_seq * top_k, num_experts)
 
         if timing:
             torch.cuda.synchronize()
@@ -196,10 +182,12 @@ class Yamoe(torch.nn.Module):
             )
         else:
             with torch.no_grad():
+                routing_weights_flat = dense_routing.view(-1, num_experts)
+                torch.cuda.set_device(hidden_states.device)
                 output = ops.experts(
-                    hidden_states.view(-1, hidden_dim),
+                    x_flat,
                     router_indices,
-                    dense_routing,
+                    routing_weights_flat,
                     gate_up,
                     gate_up_bias,
                     down_proj,
