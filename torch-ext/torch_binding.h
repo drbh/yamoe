@@ -70,6 +70,20 @@ torch::Tensor experts_static_cuda(
     int64_t top_k                    // K - top-k routing
 );
 
+// Decode-optimized fused-gather forward: reads only the active experts' weights
+// via device pointer arrays (no sort, no host sync), best for small token counts.
+torch::Tensor experts_gather_cuda(
+    torch::Tensor hidden_states,     // [T, H]
+    torch::Tensor router_indices,    // [T, K]
+    torch::Tensor routing_weights,   // [T, E] (dense)
+    torch::Tensor gate_up_proj,      // [E, H, 2H]
+    torch::Tensor gate_up_proj_bias, // [E, 2H]
+    torch::Tensor down_proj,         // [E, H, H]
+    torch::Tensor down_proj_bias,    // [E, H]
+    int64_t num_experts,             // E
+    int64_t top_k                    // K
+);
+
 std::vector<torch::Tensor> experts_backward_cuda(
     const torch::Tensor &grad_out,        // [T, H] - gradient from output
     const torch::Tensor &hidden_states,   // [T, H] - original input

@@ -208,16 +208,42 @@ class Yamoe(torch.nn.Module):
         else:
             with torch.no_grad():
                 routing_weights_flat = dense_routing.view(-1, num_experts)
-                # Opt into the CUDA-graph-capturable kernel by setting
-                # `capture_safe = True` on the module. It computes per-expert
-                # counts on the device (no host sync) and uses fixed-capacity
-                # batched GEMMs, so the whole forward can be captured in a CUDA
-                # graph. Pair it with a tight `capacity_factor` (~1.0) so the
-                # fixed-capacity GEMM matches the routed-token work. The default
-                # path keeps the faster host-driven grouped GEMM, which is not
-                # capturable. `set_device` is a host call that is fine eagerly but
-                # is skipped under capture (the device context is already set).
-                if getattr(self, "capture_safe", False):
+
+                # Pick the expert kernel. By default we auto-dispatch on the token
+                # count, because the three kernels win in different regimes:
+                #   * experts_gather (fused gather-GEMM): reads only the *active*
+                #     experts' weights via device pointer arrays (no sort, no host
+                #     sync, capturable). Wins in the decode / tiny-batch regime,
+                #     where few experts are active — empirically while
+                #     batch_seq*top_k < num_experts. For larger token counts it
+                #     re-reads shared experts and loses.
+                #   * experts_static (fixed-capacity batched GEMM): CUDA-graph
+                #     capturable; used for prefill when `capture_safe` is requested.
+                #   * experts (grouped GEMM): the default for prefill / large batch.
+                # Explicit attributes override the auto choice:
+                #   decode_gather = True/False  -> force the gather path on/off
+                #   capture_safe  = True        -> use the capturable static path
+                # The threshold is tunable via `gather_max_pairs` (default E).
+                gather_threshold = getattr(self, "gather_max_pairs", num_experts)
+                decode_gather = getattr(self, "decode_gather", None)
+                if decode_gather is None:
+                    decode_gather = batch_seq * top_k < gather_threshold
+
+                # `set_device` is a host call that is fine eagerly but is skipped on
+                # the capturable paths (the device context is already set).
+                if decode_gather:
+                    output = ops.experts_gather(
+                        x_flat,
+                        router_indices,
+                        routing_weights_flat,
+                        gate_up,
+                        gate_up_bias,
+                        down_proj,
+                        self.experts.down_proj_bias,
+                        num_experts,
+                        top_k,
+                    )
+                elif getattr(self, "capture_safe", False):
                     output = ops.experts_static(
                         x_flat,
                         router_indices,

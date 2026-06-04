@@ -81,6 +81,18 @@ TORCH_LIBRARY_EXPAND(
           "int top_k) -> Tensor");
   ops.impl("experts_static", torch::kCUDA, &experts_static_cuda);
 
+  ops.def("experts_gather("
+          "Tensor hidden_states, "
+          "Tensor router_indices, "
+          "Tensor routing_weights, "
+          "Tensor gate_up_proj, "
+          "Tensor gate_up_proj_bias, "
+          "Tensor down_proj, "
+          "Tensor down_proj_bias, "
+          "int num_experts, "
+          "int top_k) -> Tensor");
+  ops.impl("experts_gather", torch::kCUDA, &experts_gather_cuda);
+
   ops.def("experts_backward("
           "Tensor grad_out, "
           "Tensor hidden_states, "

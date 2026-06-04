@@ -34,5 +34,6 @@ src = [
     "csrc/batch_mm.cu",
     "csrc/glu.cu",
     "csrc/moe.cpp",
+    "csrc/experts_gather.cu",
     "csrc/experts_backward.cu",
 ]
