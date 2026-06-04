@@ -1,6 +1,7 @@
 // csrc/moe.cpp
 
 #include <algorithm>
+#include <vector>
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAStream.h>
@@ -43,6 +44,12 @@ torch::Tensor batch_mm(torch::Tensor x,
                        torch::Tensor batch_sizes,
                        torch::Tensor output,
                        bool trans_b = false);
+
+// Variable-sized batched matmul keyed on per-expert host token counts.
+void grouped_mm(torch::Tensor x,
+                torch::Tensor weights,
+                const std::vector<int> &counts,
+                torch::Tensor output);
 
 torch::Tensor experts_cuda(
     torch::Tensor hidden_states,     // [B*S, H] - flattened hidden states
@@ -125,9 +132,6 @@ torch::Tensor experts_cuda(
       torch::empty({E + 1},
                    device_opts); // Pre-allocate for bincount_cumsum result
 
-  // Buffer for expert token counts
-  torch::Tensor expert_tokens = torch::empty({E}, device_opts);
-
   // Final output buffer
   torch::Tensor output = torch::zeros_like(hidden_states);
 
@@ -143,25 +147,33 @@ torch::Tensor experts_cuda(
   // Compute bins using bincount_cumsum
   bincount_cumsum_cuda(sorted_values, bins, E);
 
-  // Per-expert token counts, clamped to capacity (this is where dropping happens).
-  if (E > 1) {
-    expert_tokens.slice(0, 0, E - 1) =
-        bins.slice(0, 1, E) - bins.slice(0, 0, E - 1);
-    expert_tokens[E - 1] =
-        (int32_t)(flat_indices.size(0) - bins[E - 1].item<int32_t>());
-  } else {
-    expert_tokens[0] = (int32_t)flat_indices.size(0);
-  }
-  expert_tokens = torch::clamp(expert_tokens, 0, (int32_t)C);
-
-  // Active capacity: the largest per-expert load actually present (<= C). We
-  // size the gathered / GEMM / scatter buffers to this rather than the padded
+  // Per-expert token counts, computed from the (inclusive prefix-sum) bins the
+  // same way gather does: count_e = bins[e] - bins[e-1] (bins[-1] = 0), then
+  // clamped to the capacity C (this is where token dropping happens). We pull
+  // them to the host (one D2H copy) to drive the grouped GEMMs and to size the
+  // active-capacity buffers.
+  //
+  // Active capacity = the largest per-expert load actually present (<= C). The
+  // gathered / GEMM / scatter buffers are sized to this rather than the padded
   // capacity C, so unused capacity slots cost no compute or memory. This is
   // exact: tokens are packed at the front of each expert's bin and anything
-  // past C was already dropped by the clamp above, so rows in [C_active, C)
-  // are empty for every expert.
-  const int64_t C_active =
-      std::max<int64_t>(1, expert_tokens.max().item<int32_t>());
+  // past C is dropped here, so rows in [C_active, C) are empty for every expert.
+  torch::Tensor bins_cpu_t = bins.to(torch::kCPU, torch::kInt32);
+  const int32_t *bp = bins_cpu_t.data_ptr<int32_t>();
+  std::vector<int> counts(E);
+  int64_t C_active = 1;
+  int prev = 0;
+  for (int e = 0; e < E; ++e) {
+    const int n = bp[e] - prev; // raw token count for expert e
+    prev = bp[e];
+    const int c = std::max(0, std::min<int>(n, (int)C)); // clamp to capacity
+    counts[e] = c;
+    C_active = std::max<int64_t>(C_active, c);
+  }
+
+  // Ensure weights are contiguous for the grouped GEMM (no-op when already so).
+  gate_up_proj = gate_up_proj.contiguous();
+  down_proj = down_proj.contiguous();
 
   // Buffer for gathered tokens: [E, C_active, H]
   torch::Tensor x = torch::empty({E, C_active, H}, float_opts);
@@ -172,7 +184,8 @@ torch::Tensor experts_cuda(
   // Gather tokens by expert: [T, H] -> [E, C_active, H]
   gather_cuda(hidden_states, sorted_indices, bins, x, E, C_active, K);
 
-  batch_mm(x, gate_up_proj, expert_tokens, gate_up, true);
+  // Gate/up projection as a variable-sized grouped GEMM (only real tokens).
+  grouped_mm(x, gate_up_proj, counts, gate_up);
 
   // add the gate bias to the output in-place
   gate_up.add_(gate_up_proj_bias.unsqueeze(1));
@@ -193,12 +206,15 @@ torch::Tensor experts_cuda(
   gate.mul_(torch::sigmoid(gate * 1.702f));
   up.add_(1).mul_(gate);
 
-  // Down projection uses GLU result directly
-  gate_up.resize_(0);
-  batch_mm(up, down_proj, expert_tokens, gate_up, true);
+  // Down projection. `up` is a strided (interleaved) view of gate_up, so
+  // materialize it contiguous for the grouped GEMM and write into a fresh
+  // [E, C_active, H] buffer.
+  torch::Tensor up_contig = up.contiguous();
+  torch::Tensor down_out = torch::empty({E, C_active, H}, float_opts);
+  grouped_mm(up_contig, down_proj, counts, down_out);
 
   // add the down_bias in-place
-  gate_up.add_(down_proj_bias.unsqueeze(1));
+  down_out.add_(down_proj_bias.unsqueeze(1));
 
   // Stage allocations right before use
   torch::Tensor selected_weights = torch::empty({T * K}, float_opts);
@@ -223,7 +239,7 @@ torch::Tensor experts_cuda(
   );
 
   // Scatter back to original positions with weights applied
-  scatter_cuda(gate_up.view({E, C_active, H}),
+  scatter_cuda(down_out,
                sorted_indices,
                bins,
                weights_sorted,
