@@ -3,6 +3,9 @@ name: Build Kernel
 on:
   push:
     branches: [main]
+    paths:
+      - "csrc/**"
+      - "torch-ext/**"
   workflow_dispatch:
     inputs:
       branch:
