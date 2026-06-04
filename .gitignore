@@ -3,7 +3,6 @@
 .venv
 cmake
 result
-scripts
 __pycache__
 CMakeLists.txt
 setup.py
