@@ -38,8 +38,9 @@ repo_root = Path(__file__).resolve().parent.parent
     # repo_path=repo_root / "result",
 layer = LayerRepository(
     repo_id="drbh/yamoe",
-    revision=1,
+    revision="v1",
     layer_name="Yamoe",
+    trust_remote_code=True
 )
 mapping = {"MegaBlocksMoeMLP": {"cuda": layer}}
 
