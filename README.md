@@ -32,5 +32,5 @@ You can find the kernel on [Kernel Hub](https://huggingface.co/drbh/yamoe) and i
 
 ```python
 from kernels import get_kernel
-yamoe = get_kernel("drbh/yamoe", revision=1)
+yamoe = get_kernel("drbh/yamoe", revision="main")
 ```

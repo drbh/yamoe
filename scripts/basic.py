@@ -6,7 +6,7 @@
 #   "accelerate",
 #   "triton",
 #   "numpy",
-#   "kernels==0.13.0",
+#   "kernels==0.15.2",
 # ]
 # [[tool.uv.index]]
 # name = "pytorch-cu129"
