@@ -27,6 +27,7 @@ src = [
     "csrc/sort.cu",
     "csrc/bincount_cumsum.cu",
     "csrc/batch_mm.cu",
+    "csrc/glu.cu",
     "csrc/moe.cpp",
     "csrc/experts_backward.cu",
 ]

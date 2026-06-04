@@ -45,6 +45,17 @@ torch::Tensor batch_mm(torch::Tensor x,
                        torch::Tensor output,
                        bool trans_b = false);
 
+// Fused, capacity-aware bias-add + GLU over only the real token rows.
+void fused_glu_cuda(torch::Tensor gate_up,
+                    torch::Tensor bias,
+                    torch::Tensor counts,
+                    torch::Tensor out);
+
+// Per-expert bias add over only the real token rows.
+void add_bias_rows_cuda(torch::Tensor out,
+                        torch::Tensor bias,
+                        torch::Tensor counts);
+
 // Variable-sized batched matmul keyed on per-expert host token counts.
 void grouped_mm(torch::Tensor x,
                 torch::Tensor weights,
@@ -171,9 +182,17 @@ torch::Tensor experts_cuda(
     C_active = std::max<int64_t>(C_active, c);
   }
 
-  // Ensure weights are contiguous for the grouped GEMM (no-op when already so).
+  // Ensure weights/biases are contiguous for the grouped GEMM and the fused
+  // elementwise kernels (no-op when already so).
   gate_up_proj = gate_up_proj.contiguous();
   down_proj = down_proj.contiguous();
+  gate_up_proj_bias = gate_up_proj_bias.contiguous();
+  down_proj_bias = down_proj_bias.contiguous();
+
+  // Per-expert counts on device for the capacity-aware elementwise kernels.
+  torch::Tensor counts_dev =
+      torch::from_blob((void *)counts.data(), {E}, torch::kInt32)
+          .to(hidden_states.device());
 
   // Buffer for gathered tokens: [E, C_active, H]
   torch::Tensor x = torch::empty({E, C_active, H}, float_opts);
@@ -187,34 +206,16 @@ torch::Tensor experts_cuda(
   // Gate/up projection as a variable-sized grouped GEMM (only real tokens).
   grouped_mm(x, gate_up_proj, counts, gate_up);
 
-  // add the gate bias to the output in-place
-  gate_up.add_(gate_up_proj_bias.unsqueeze(1));
+  // Fused bias-add + GLU over only the real token rows: [E, C, 2H] -> [E, C, H].
+  // This processes ~total tokens of traffic (not E * C) and replaces the
+  // separate bias add, de-interleave, clamps, sigmoid and multiply.
+  torch::Tensor glu_out = torch::empty({E, C_active, H}, float_opts);
+  fused_glu_cuda(gate_up, gate_up_proj_bias, counts_dev, glu_out);
 
-  // Compute GLU in-place, reusing gate_up buffer for output
-  auto gate = gate_up.index({torch::indexing::Ellipsis,
-                             torch::indexing::Slice(torch::indexing::None,
-                                                    torch::indexing::None,
-                                                    2)});
-  auto up =
-      gate_up.index({torch::indexing::Ellipsis,
-                     torch::indexing::Slice(1, torch::indexing::None, 2)});
-
-  const float limit = 7.0f;
-  gate = gate.clamp(/*min=*/c10::nullopt, /*max=*/limit);
-  up = up.clamp(/*min=*/-limit, /*max=*/limit);
-
-  gate.mul_(torch::sigmoid(gate * 1.702f));
-  up.add_(1).mul_(gate);
-
-  // Down projection. `up` is a strided (interleaved) view of gate_up, so
-  // materialize it contiguous for the grouped GEMM and write into a fresh
-  // [E, C_active, H] buffer.
-  torch::Tensor up_contig = up.contiguous();
+  // Down projection (grouped GEMM) + per-expert bias, both over real tokens.
   torch::Tensor down_out = torch::empty({E, C_active, H}, float_opts);
-  grouped_mm(up_contig, down_proj, counts, down_out);
-
-  // add the down_bias in-place
-  down_out.add_(down_proj_bias.unsqueeze(1));
+  grouped_mm(glu_out, down_proj, counts, down_out);
+  add_bias_rows_cuda(down_out, down_proj_bias, counts_dev);
 
   // Stage allocations right before use
   torch::Tensor selected_weights = torch::empty({T * K}, float_opts);
