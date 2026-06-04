@@ -1,6 +1,7 @@
 [general]
 name = "yamoe"
 backends = ["cuda"]
+version = 1
 
 [torch]
 src = [

@@ -1,0 +1,42 @@
+name: Build Kernel
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Hub branch to upload the build"
+        default: main
+        required: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build kernel via HF Jobs and upload to drbh/yamoe
+        uses: huggingface/kernel-builder-job@main
+        with:
+          token: ${{ secrets.HF_TOKEN }}
+          namespace: drbh
+          flavor: cpu-xl
+          timeout: "7200"
+          # image: uses default nix image
+          script: |
+            # The HF Jobs container is started with `set -x`, which would echo
+            # the token below into the streamed logs. Disable tracing first.
+            set +x
+            export HF_TOKEN="${{ secrets.HF_TOKEN }}"
+            # We rebuild the artifacts, so don't pull the existing LFS blobs.
+            export GIT_LFS_SKIP_SMUDGE=1
+
+            # Build the exact commit that triggered this workflow.
+            git clone "${{ github.server_url }}/${{ github.repository }}" yamoe
+            cd yamoe
+            git checkout "${{ github.sha }}"
+
+            nix run github:huggingface/kernels#kernel-builder -- build-and-upload \
+              --repo-id drbh/yamoe \
+              --branch "${{ github.event.inputs.branch || 'main' }}"
