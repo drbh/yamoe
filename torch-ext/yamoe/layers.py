@@ -1,3 +1,4 @@
+import math
 import torch
 import time
 from ._ops import ops
@@ -107,7 +108,11 @@ class Yamoe(torch.nn.Module):
     can_torch_compile: bool = False
 
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        self.enable_router_grads = False
+        # Default to the inference path, but honor a caller that opts into the
+        # autograd-aware path (_ExpertsFn) by setting `enable_router_grads = True`
+        # before calling forward. Previously this was hardcoded to False, which
+        # silently disabled backward.
+        self.enable_router_grads = getattr(self, "enable_router_grads", False)
         self._timing_stats = {}
 
         batch_size, seq_len, hidden_dim = hidden_states.shape
@@ -159,7 +164,27 @@ class Yamoe(torch.nn.Module):
         gate_up = self.experts.gate_up_proj[:, :, : 2 * hidden_dim].contiguous()
         gate_up_bias = self.experts.gate_up_proj_bias[:, : 2 * hidden_dim].contiguous()
         down_proj = self.experts.down_proj[:, :hidden_dim, :].contiguous()
-        expert_capacity = ceil_div(batch_seq * top_k, num_experts)
+
+        # Per-expert token capacity. The kernel processes at most `expert_capacity`
+        # tokens per expert and silently drops the rest, so a value that is too
+        # small degrades quality on imbalanced routing. `capacity_factor`
+        # (GShard/Switch convention) scales the mean load: 1.0 = exactly the mean
+        # (drops on any imbalance), higher = more headroom at the cost of memory
+        # and compute, which both grow linearly with capacity. Default 2.0 is the
+        # usual inference setting; raise it toward `batch_seq` for drop-free, lower
+        # it to save memory. An expert can never receive more than `batch_seq`
+        # tokens, so we clamp there (a large factor is drop-free without waste).
+        capacity_factor = float(getattr(self, "capacity_factor", 2.0))
+        expert_capacity = math.ceil(capacity_factor * batch_seq * top_k / num_experts)
+        expert_capacity = max(1, min(expert_capacity, batch_seq))
+
+        # Optionally surface how many token slots were dropped this call (opt-in:
+        # the bincount + .item() sync is skipped unless requested).
+        if getattr(self, "report_capacity_drops", False):
+            counts = torch.bincount(router_indices.reshape(-1), minlength=num_experts)
+            self._last_capacity_dropped = int(
+                (counts - expert_capacity).clamp(min=0).sum().item()
+            )
 
         if timing:
             torch.cuda.synchronize()

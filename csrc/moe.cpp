@@ -1,5 +1,7 @@
 // csrc/moe.cpp
 
+#include <algorithm>
+
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAStream.h>
 #include <torch/torch.h>
@@ -123,30 +125,25 @@ torch::Tensor experts_cuda(
       torch::empty({E + 1},
                    device_opts); // Pre-allocate for bincount_cumsum result
 
-  // Buffer for gathered tokens
-  torch::Tensor x = torch::empty({E, C, H}, float_opts);
-
   // Buffer for expert token counts
   torch::Tensor expert_tokens = torch::empty({E}, device_opts);
-
-  // Buffers for intermediate results
-  torch::Tensor gate_up = torch::empty({E, C, 2 * H}, float_opts);
 
   // Final output buffer
   torch::Tensor output = torch::zeros_like(hidden_states);
 
   // COMPUTE
 
-  // Sort tokens by expert
-  sort_cuda(flat_indices, 32, sorted_values, sorted_indices);
+  // Sort tokens by expert. Values are expert ids in [0, E), so we only need
+  // ceil(log2(E)) radix bits rather than a full 32-bit sort.
+  int64_t sort_bits = 1;
+  while ((1LL << sort_bits) < E)
+    sort_bits++;
+  sort_cuda(flat_indices, sort_bits, sorted_values, sorted_indices);
 
   // Compute bins using bincount_cumsum
   bincount_cumsum_cuda(sorted_values, bins, E);
 
-  // Gather tokens by expert
-  // [T, H] -> [E, C, H]
-  gather_cuda(hidden_states, sorted_indices, bins, x, E, C, K);
-
+  // Per-expert token counts, clamped to capacity (this is where dropping happens).
   if (E > 1) {
     expert_tokens.slice(0, 0, E - 1) =
         bins.slice(0, 1, E) - bins.slice(0, 0, E - 1);
@@ -155,8 +152,25 @@ torch::Tensor experts_cuda(
   } else {
     expert_tokens[0] = (int32_t)flat_indices.size(0);
   }
-  // Clamp to expert capacity
   expert_tokens = torch::clamp(expert_tokens, 0, (int32_t)C);
+
+  // Active capacity: the largest per-expert load actually present (<= C). We
+  // size the gathered / GEMM / scatter buffers to this rather than the padded
+  // capacity C, so unused capacity slots cost no compute or memory. This is
+  // exact: tokens are packed at the front of each expert's bin and anything
+  // past C was already dropped by the clamp above, so rows in [C_active, C)
+  // are empty for every expert.
+  const int64_t C_active =
+      std::max<int64_t>(1, expert_tokens.max().item<int32_t>());
+
+  // Buffer for gathered tokens: [E, C_active, H]
+  torch::Tensor x = torch::empty({E, C_active, H}, float_opts);
+
+  // Buffer for intermediate results: [E, C_active, 2H]
+  torch::Tensor gate_up = torch::empty({E, C_active, 2 * H}, float_opts);
+
+  // Gather tokens by expert: [T, H] -> [E, C_active, H]
+  gather_cuda(hidden_states, sorted_indices, bins, x, E, C_active, K);
 
   batch_mm(x, gate_up_proj, expert_tokens, gate_up, true);
 
@@ -209,14 +223,14 @@ torch::Tensor experts_cuda(
   );
 
   // Scatter back to original positions with weights applied
-  scatter_cuda(gate_up.view({E, C, H}),
+  scatter_cuda(gate_up.view({E, C_active, H}),
                sorted_indices,
                bins,
                weights_sorted,
                output,
                T,
                E,
-               C,
+               C_active,
                K);
 
   return output;

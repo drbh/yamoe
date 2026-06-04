@@ -1,8 +1,12 @@
 # /// script
 # requires-python = "==3.10"
-# dependencies = ["torch==2.7.0", "triton", "numpy", "kernels"]
+# dependencies = ["torch==2.8.0", "triton", "numpy", "kernels==0.13.0"]
+# [[tool.uv.index]]
+# name = "pytorch-cu129"
+# url = "https://download.pytorch.org/whl/cu129"
+# explicit = true
 # [tool.uv.sources]
-# kernels = { git = "https://github.com/huggingface/kernels.git" }
+# torch = [{ index = "pytorch-cu129" }]
 # ///
 
 import time
@@ -18,7 +22,9 @@ torch.cuda.manual_seed_all(42)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
-yamoe = get_kernel("drbh/yamoe", revision="v0.2.0")
+# Load the locally built kernel (run ./dev-build.sh first to produce ./result).
+# Swap for `get_kernel("drbh/yamoe", revision=...)` to load from the Hub instead.
+yamoe = get_local_kernel(Path("result"), "yamoe")
 
 # Configuration
 batch_size, seq_len, hidden_dim = 16, 256, 2880
