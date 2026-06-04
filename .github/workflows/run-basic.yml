@@ -1,0 +1,28 @@
+name: Run basic
+
+# Runs basic.py on an HF Jobs GPU: loads gpt-oss-20b, swaps its MoE for the
+# yamoe kernel (pulled from drbh/yamoe@main), and prints the logits.
+# Run "Build Kernel" first so the Hub has a fresh kernel to pull.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run basic.py on an HF Jobs GPU
+        uses: huggingface/kernel-builder-job@main
+        with:
+          token: ${{ secrets.HF_TOKEN }}
+          namespace: drbh
+          flavor: h200
+          image: ghcr.io/astral-sh/uv:python3.10-bookworm
+          timeout: "3600"
+          script: |
+            set +x
+            export HF_TOKEN="${{ secrets.HF_TOKEN }}"
+            git clone "${{ github.server_url }}/${{ github.repository }}" yamoe
+            cd yamoe
+            git checkout "${{ github.sha }}"
+            uv run basic.py
