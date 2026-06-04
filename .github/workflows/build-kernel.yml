@@ -22,7 +22,7 @@ jobs:
           token: ${{ secrets.HF_TOKEN }}
           namespace: drbh
           flavor: cpu-xl
-          timeout: "7200"
+          timeout: "21600"
           # image: uses default nix image
           script: |
             # The HF Jobs container is started with `set -x`, which would echo
@@ -38,5 +38,7 @@ jobs:
             git checkout "${{ github.sha }}"
 
             nix run github:huggingface/kernels#kernel-builder -- build-and-upload \
+              --max-jobs 4 \
+              --cores 4 \
               --repo-id drbh/yamoe \
               --branch "${{ github.event.inputs.branch || 'main' }}"
