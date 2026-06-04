@@ -20,7 +20,7 @@ jobs:
           flavor: h200
           image: ghcr.io/astral-sh/uv:python3.10-bookworm
           timeout: "3600"
-          files: basic.py
+          files: scripts/basic.py
           script: |
             set +x
             export HF_TOKEN="${{ secrets.HF_TOKEN }}"
