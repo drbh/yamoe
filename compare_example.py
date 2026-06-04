@@ -1,8 +1,12 @@
 # /// script
 # requires-python = "==3.10"
-# dependencies = ["torch==2.7.0", "triton", "numpy", "kernels"]
+# dependencies = ["torch==2.8.0", "triton", "numpy", "kernels==0.13.0"]
+# [[tool.uv.index]]
+# name = "pytorch-cu129"
+# url = "https://download.pytorch.org/whl/cu129"
+# explicit = true
 # [tool.uv.sources]
-# kernels = { git = "https://github.com/huggingface/kernels.git" }
+# torch = [{ index = "pytorch-cu129" }]
 # ///
 
 import time
@@ -22,7 +26,7 @@ torch.backends.cudnn.benchmark = False
 
 np.set_printoptions(precision=4)
 
-load_method = 3  # 1: sym, 2: local, 3: hf
+load_method = 2  # 1: sym, 2: local (./result), 3: hf
 
 if load_method == 1:
     sys.path.insert(0, "./torch-ext")

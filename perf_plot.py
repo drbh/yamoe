@@ -1,8 +1,12 @@
 # /// script
 # requires-python = "==3.10"
-# dependencies = ["torch==2.7.0", "triton", "numpy", "kernels", "matplotlib"]
+# dependencies = ["torch==2.8.0", "triton", "numpy", "kernels==0.13.0", "matplotlib"]
+# [[tool.uv.index]]
+# name = "pytorch-cu129"
+# url = "https://download.pytorch.org/whl/cu129"
+# explicit = true
 # [tool.uv.sources]
-# kernels = { git = "https://github.com/huggingface/kernels.git" }
+# torch = [{ index = "pytorch-cu129" }]
 # ///
 
 import time
@@ -19,8 +23,11 @@ import numpy as np
 # import yamoe
 # import yamoe.reference as reference
 
-yamoe = get_kernel("drbh/yamoe", revision="v0.2.0")
-reference = yamoe.reference
+# Load the locally built kernel (run ./dev-build.sh first to produce ./result).
+# Swap for `get_kernel("drbh/yamoe", revision=...)` to load from the Hub instead.
+yamoe = get_local_kernel(Path("result"), "yamoe")
+# `reference.py` was vendored into the kernel; GptOssExperts now lives here.
+reference = yamoe.vendored.gpt_oss_mlp
 
 # Setup
 torch.manual_seed(0)

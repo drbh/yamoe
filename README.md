@@ -35,6 +35,30 @@ from kernels import get_kernel
 yamoe = get_kernel("drbh/yamoe", revision="v0.2.0")
 ```
 
+### Building
+
+The full release matrix (every Torch/CUDA variant × every CUDA capability) is
+built and pushed with kernel-builder:
+
+```bash
+nix build .#bundle          # all variants — what gets published to the Hub
+```
+
+For local iteration this is slow. To build only what *your* machine runs:
+
+```bash
+# Single Torch/CUDA variant (defaults to torch 2.8 / cu12.9):
+YAMOE_DEV=1 nix build --impure .#bundle
+
+# Single Torch variant AND only your GPU's arch (auto-detected sm) — much
+# faster. Links the result as ./result, which the example scripts consume:
+./dev-build.sh && uv run compare_example.py
+```
+
+Override the target with `YAMOE_DEV_TORCH`, `YAMOE_DEV_CUDA`, and `YAMOE_DEV_SM`
+(e.g. `YAMOE_DEV_SM=8.6 ./dev-build.sh`). These only affect local builds; the
+default `nix build` and the published kernel keep the full matrix.
+
 ### Performance
 
 `yamoe` scales well as batch sizes increase in comparision to the naive method of repeating the data and computation for every item in the batch as shown in the reference in [torch-ext/yamoe/reference.py](torch-ext/yamoe/reference.py). This bench can be reproduced by running `uv run perf_plot.py` or a smaller bench and correctness comparision can be run with `uv run compare_example.py`
