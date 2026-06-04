@@ -62,7 +62,23 @@ void grouped_mm(torch::Tensor x,
                 const std::vector<int> &counts,
                 torch::Tensor output);
 
-torch::Tensor experts_cuda(
+// Shared implementation. `capture_safe` selects between two ways of driving the
+// per-expert GEMMs:
+//
+//   * capture_safe = false (default): pull per-expert token counts to the HOST
+//     (one D2H copy of `bins`) and run a variable-sized grouped cuBLAS GEMM that
+//     processes only the real tokens. Fastest under imbalanced / loose-capacity
+//     routing, but the host read + cublas grouped GEMM's stream sync make it
+//     impossible to capture in a CUDA graph.
+//
+//   * capture_safe = true: compute per-expert counts on the DEVICE (no D2H) and
+//     run fixed-capacity batched GEMMs over [E, C, H]. No host sync anywhere, so
+//     the whole forward is CUDA-graph capturable. At a tight `expert_capacity`
+//     (capacity_factor ~1.0, C = ceil(T*K/E)) the batched GEMM computes ~exactly
+//     the routed-token count, i.e. it matches the grouped GEMM's work with zero
+//     padding waste. This is the regime (decode / small batch) where graphs and
+//     their launch-overhead removal actually matter.
+static torch::Tensor experts_impl(
     torch::Tensor hidden_states,     // [B*S, H] - flattened hidden states
     torch::Tensor router_indices,    // [B*S, K] - expert indices per token
     torch::Tensor routing_weights,   // [B*S, E] or [B*S, K] - routing weights
@@ -72,7 +88,8 @@ torch::Tensor experts_cuda(
     torch::Tensor down_proj_bias,    // [E, H] - down projection bias
     int64_t expert_capacity,         // C - capacity per expert
     int64_t num_experts,             // E - number of experts
-    int64_t top_k                    // K - top-k routing
+    int64_t top_k,                   // K - top-k routing
+    bool capture_safe                // device-driven, CUDA-graph capturable
 ) {
   // Input validation
   TORCH_CHECK(hidden_states.is_cuda(), "hidden_states must be on CUDA");
@@ -158,41 +175,51 @@ torch::Tensor experts_cuda(
   // Compute bins using bincount_cumsum
   bincount_cumsum_cuda(sorted_values, bins, E);
 
-  // Per-expert token counts, computed from the (inclusive prefix-sum) bins the
-  // same way gather does: count_e = bins[e] - bins[e-1] (bins[-1] = 0), then
-  // clamped to the capacity C (this is where token dropping happens). We pull
-  // them to the host (one D2H copy) to drive the grouped GEMMs and to size the
-  // active-capacity buffers.
-  //
-  // Active capacity = the largest per-expert load actually present (<= C). The
-  // gathered / GEMM / scatter buffers are sized to this rather than the padded
-  // capacity C, so unused capacity slots cost no compute or memory. This is
-  // exact: tokens are packed at the front of each expert's bin and anything
-  // past C is dropped here, so rows in [C_active, C) are empty for every expert.
-  torch::Tensor bins_cpu_t = bins.to(torch::kCPU, torch::kInt32);
-  const int32_t *bp = bins_cpu_t.data_ptr<int32_t>();
-  std::vector<int> counts(E);
-  int64_t C_active = 1;
-  int prev = 0;
-  for (int e = 0; e < E; ++e) {
-    const int n = bp[e] - prev; // raw token count for expert e
-    prev = bp[e];
-    const int c = std::max(0, std::min<int>(n, (int)C)); // clamp to capacity
-    counts[e] = c;
-    C_active = std::max<int64_t>(C_active, c);
-  }
-
-  // Ensure weights/biases are contiguous for the grouped GEMM and the fused
-  // elementwise kernels (no-op when already so).
+  // Ensure weights/biases are contiguous for the GEMMs and the fused elementwise
+  // kernels (no-op when already so).
   gate_up_proj = gate_up_proj.contiguous();
   down_proj = down_proj.contiguous();
   gate_up_proj_bias = gate_up_proj_bias.contiguous();
   down_proj_bias = down_proj_bias.contiguous();
 
-  // Per-expert counts on device for the capacity-aware elementwise kernels.
-  torch::Tensor counts_dev =
-      torch::from_blob((void *)counts.data(), {E}, torch::kInt32)
-          .to(hidden_states.device());
+  // Per-expert token counts derived from the (inclusive prefix-sum) bins the same
+  // way gather does: count_e = bins[e] - bins[e-1] (bins[-1] = 0), clamped to the
+  // capacity C (this is where token dropping happens).
+  std::vector<int> counts;  // host counts (non-capture path only)
+  torch::Tensor counts_dev; // device counts for the capacity-aware kernels
+  int64_t C_active;         // capacity the working buffers are sized to
+
+  if (!capture_safe) {
+    // Pull counts to the host (one D2H copy) to drive the variable-sized grouped
+    // GEMMs and to size the active-capacity buffers. Active capacity = the
+    // largest per-expert load actually present (<= C), so unused capacity slots
+    // cost no compute or memory. Exact: tokens are packed at the front of each
+    // expert's bin and anything past C is dropped here.
+    torch::Tensor bins_cpu_t = bins.to(torch::kCPU, torch::kInt32);
+    const int32_t *bp = bins_cpu_t.data_ptr<int32_t>();
+    counts.resize(E);
+    C_active = 1;
+    int prev = 0;
+    for (int e = 0; e < E; ++e) {
+      const int n = bp[e] - prev; // raw token count for expert e
+      prev = bp[e];
+      const int c = std::max(0, std::min<int>(n, (int)C)); // clamp to capacity
+      counts[e] = c;
+      C_active = std::max<int64_t>(C_active, c);
+    }
+    counts_dev = torch::from_blob((void *)counts.data(), {E}, torch::kInt32)
+                     .to(hidden_states.device());
+  } else {
+    // Capture-safe: compute counts entirely on-device (no D2H), and size buffers
+    // to the host-known padded capacity C (a device-derived C_active would itself
+    // require a D2H). counts_dev[e] = clamp(bins[e] - bins[e-1], 0, C).
+    C_active = C;
+    torch::Tensor bins_e = bins.narrow(0, 0, E);          // [E]: bins[0..E-1]
+    torch::Tensor bins_prev = torch::zeros({E}, device_opts); // bins[e-1], bins[-1]=0
+    if (E > 1)
+      bins_prev.narrow(0, 1, E - 1).copy_(bins.narrow(0, 0, E - 1));
+    counts_dev = (bins_e - bins_prev).clamp(0, C).to(torch::kInt32).contiguous();
+  }
 
   // Buffer for gathered tokens: [E, C_active, H]
   torch::Tensor x = torch::empty({E, C_active, H}, float_opts);
@@ -203,8 +230,14 @@ torch::Tensor experts_cuda(
   // Gather tokens by expert: [T, H] -> [E, C_active, H]
   gather_cuda(hidden_states, sorted_indices, bins, x, E, C_active, K);
 
-  // Gate/up projection as a variable-sized grouped GEMM (only real tokens).
-  grouped_mm(x, gate_up_proj, counts, gate_up);
+  // Gate/up projection. Non-capture: variable-sized grouped GEMM over only the
+  // real tokens (host counts). Capture-safe: fixed-capacity batched GEMM over
+  // [E, C, H] @ [E, H, 2H] (no host counts, no stream sync); padded rows are
+  // computed but never read (gather fills, and fused_glu/scatter mask via counts).
+  if (!capture_safe)
+    grouped_mm(x, gate_up_proj, counts, gate_up);
+  else
+    torch::bmm_out(gate_up, x, gate_up_proj);
 
   // Fused bias-add + GLU over only the real token rows: [E, C, 2H] -> [E, C, H].
   // This processes ~total tokens of traffic (not E * C) and replaces the
@@ -212,9 +245,12 @@ torch::Tensor experts_cuda(
   torch::Tensor glu_out = torch::empty({E, C_active, H}, float_opts);
   fused_glu_cuda(gate_up, gate_up_proj_bias, counts_dev, glu_out);
 
-  // Down projection (grouped GEMM) + per-expert bias, both over real tokens.
+  // Down projection (grouped or fixed-capacity batched GEMM) + per-expert bias.
   torch::Tensor down_out = torch::empty({E, C_active, H}, float_opts);
-  grouped_mm(glu_out, down_proj, counts, down_out);
+  if (!capture_safe)
+    grouped_mm(glu_out, down_proj, counts, down_out);
+  else
+    torch::bmm_out(down_out, glu_out, down_proj);
   add_bias_rows_cuda(down_out, down_proj_bias, counts_dev);
 
   // Stage allocations right before use
@@ -251,4 +287,43 @@ torch::Tensor experts_cuda(
                K);
 
   return output;
+}
+
+// Default forward: host-driven variable-sized grouped GEMM (fastest, not
+// CUDA-graph capturable).
+torch::Tensor experts_cuda(
+    torch::Tensor hidden_states,
+    torch::Tensor router_indices,
+    torch::Tensor routing_weights,
+    torch::Tensor gate_up_proj,
+    torch::Tensor gate_up_proj_bias,
+    torch::Tensor down_proj,
+    torch::Tensor down_proj_bias,
+    int64_t expert_capacity,
+    int64_t num_experts,
+    int64_t top_k) {
+  return experts_impl(hidden_states, router_indices, routing_weights,
+                      gate_up_proj, gate_up_proj_bias, down_proj, down_proj_bias,
+                      expert_capacity, num_experts, top_k,
+                      /*capture_safe=*/false);
+}
+
+// Capture-safe forward: device-driven, fixed-capacity batched GEMMs. No host
+// sync, so the whole forward can be captured in a CUDA graph. Best paired with a
+// tight expert_capacity so the fixed-capacity GEMM matches the routed-token work.
+torch::Tensor experts_static_cuda(
+    torch::Tensor hidden_states,
+    torch::Tensor router_indices,
+    torch::Tensor routing_weights,
+    torch::Tensor gate_up_proj,
+    torch::Tensor gate_up_proj_bias,
+    torch::Tensor down_proj,
+    torch::Tensor down_proj_bias,
+    int64_t expert_capacity,
+    int64_t num_experts,
+    int64_t top_k) {
+  return experts_impl(hidden_states, router_indices, routing_weights,
+                      gate_up_proj, gate_up_proj_bias, down_proj, down_proj_bias,
+                      expert_capacity, num_experts, top_k,
+                      /*capture_safe=*/true);
 }

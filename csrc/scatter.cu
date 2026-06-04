@@ -1,5 +1,6 @@
 // csrc/scatter.cu
 
+#include <c10/cuda/CUDAStream.h>
 #include <cstdint>
 #include <cuda_runtime.h>
 #include <torch/torch.h>
@@ -120,9 +121,11 @@ void scatter_cuda(
 ) {
   const int64_t H = src.size(2);
 
-  // Grid over experts x capacity; threads over H
+  // Grid over experts x capacity; threads over H. Launch on the current stream
+  // so the op composes with CUDA-graph capture / non-default-stream execution.
   dim3 grid(E, C);
   int threads = 256;
+  auto stream = c10::cuda::getCurrentCUDAStream();
 
   // Include Half + BFloat16 in dispatch
   AT_DISPATCH_FLOATING_TYPES_AND2(
@@ -132,7 +135,7 @@ void scatter_cuda(
       "scatter_cuda",
       ([&] {
         using scalar_t_ = scalar_t;
-        scatter_kernel<scalar_t_><<<grid, threads>>>(
+        scatter_kernel<scalar_t_><<<grid, threads, 0, stream>>>(
             src.data_ptr<scalar_t_>(),
             indices.data_ptr<int>(),
             bins.data_ptr<int>(),

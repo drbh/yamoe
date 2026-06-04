@@ -1,5 +1,6 @@
 // csrc/bincount_cumsum.cu
 
+#include <c10/cuda/CUDAStream.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <torch/torch.h>
@@ -76,13 +77,14 @@ void bincount_cumsum_cuda(
 
   // Launch kernel with shared memory for bincount
   const size_t shared_mem_size = n_bins * sizeof(int);
+  auto stream = c10::cuda::getCurrentCUDAStream();
 
   AT_DISPATCH_INTEGRAL_TYPES(
       input.scalar_type(),
       "bincount_cumsum_cuda",
       ([&] {
         bincount_cumsum_kernel<scalar_t>
-            <<<n_blocks, threads_per_block, shared_mem_size>>>(
+            <<<n_blocks, threads_per_block, shared_mem_size, stream>>>(
                 input.data_ptr<scalar_t>(),
                 bins_out.data_ptr<int32_t>(),
                 n_input,

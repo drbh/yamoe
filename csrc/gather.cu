@@ -1,5 +1,6 @@
 // csrc/gather.cu
 
+#include <c10/cuda/CUDAStream.h>
 #include <cuda_runtime.h>
 #include <torch/torch.h>
 
@@ -82,9 +83,11 @@ void gather_cuda(
   TORCH_CHECK(output.size(0) == E && output.size(1) == C && output.size(2) == H,
               "Output tensor must have shape [E, C, H]");
 
-  // Launch kernel with 2D grid (E, C)
+  // Launch kernel with 2D grid (E, C) on the current stream (so the op composes
+  // with CUDA-graph capture and non-default-stream execution).
   dim3 grid(E, C);
   int threads = 256;
+  auto stream = c10::cuda::getCurrentCUDAStream();
 
   AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf,
                                   at::kBFloat16,
@@ -93,7 +96,7 @@ void gather_cuda(
                                   ([&] {
                                     using scalar_t_ =
                                         scalar_t; // avoid shadowing surprises
-                                    gather_kernel<scalar_t_><<<grid, threads>>>(
+                                    gather_kernel<scalar_t_><<<grid, threads, 0, stream>>>(
                                         x.data_ptr<scalar_t_>(),
                                         indices.data_ptr<int>(),
                                         bins.data_ptr<int>(),

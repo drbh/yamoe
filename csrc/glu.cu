@@ -8,6 +8,7 @@
 // single pass (one read of 2H, one write of H) instead of ~6 separate
 // elementwise kernels over the full padded buffer.
 
+#include <c10/cuda/CUDAStream.h>
 #include <cuda_runtime.h>
 #include <torch/torch.h>
 
@@ -59,9 +60,10 @@ void fused_glu_cuda(
   int threads = H < 1024 ? H : 1024;
   if (threads < 1)
     threads = 1;
+  auto stream = c10::cuda::getCurrentCUDAStream();
   AT_DISPATCH_FLOATING_TYPES_AND2(
       torch::kHalf, torch::kBFloat16, gate_up.scalar_type(), "fused_glu", ([&] {
-        fused_glu_kernel<scalar_t><<<grid, threads>>>(
+        fused_glu_kernel<scalar_t><<<grid, threads, 0, stream>>>(
             gate_up.data_ptr<scalar_t>(),
             bias.data_ptr<scalar_t>(),
             counts.data_ptr<int>(),
@@ -103,9 +105,10 @@ void add_bias_rows_cuda(
   int threads = H < 1024 ? H : 1024;
   if (threads < 1)
     threads = 1;
+  auto stream = c10::cuda::getCurrentCUDAStream();
   AT_DISPATCH_FLOATING_TYPES_AND2(
       torch::kHalf, torch::kBFloat16, out.scalar_type(), "add_bias_rows", ([&] {
-        add_bias_rows_kernel<scalar_t><<<grid, threads>>>(
+        add_bias_rows_kernel<scalar_t><<<grid, threads, 0, stream>>>(
             out.data_ptr<scalar_t>(),
             bias.data_ptr<scalar_t>(),
             counts.data_ptr<int>(),

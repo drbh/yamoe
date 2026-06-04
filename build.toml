@@ -2,6 +2,10 @@
 name = "yamoe"
 backends = ["cuda"]
 version = 1
+license = "MIT"
+
+[general.hub]
+repo-id = "drbh/yamoe"
 
 [torch]
 src = [

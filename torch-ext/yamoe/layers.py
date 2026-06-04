@@ -208,19 +208,42 @@ class Yamoe(torch.nn.Module):
         else:
             with torch.no_grad():
                 routing_weights_flat = dense_routing.view(-1, num_experts)
-                torch.cuda.set_device(hidden_states.device)
-                output = ops.experts(
-                    x_flat,
-                    router_indices,
-                    routing_weights_flat,
-                    gate_up,
-                    gate_up_bias,
-                    down_proj,
-                    self.experts.down_proj_bias,
-                    expert_capacity,
-                    num_experts,
-                    top_k,
-                )
+                # Opt into the CUDA-graph-capturable kernel by setting
+                # `capture_safe = True` on the module. It computes per-expert
+                # counts on the device (no host sync) and uses fixed-capacity
+                # batched GEMMs, so the whole forward can be captured in a CUDA
+                # graph. Pair it with a tight `capacity_factor` (~1.0) so the
+                # fixed-capacity GEMM matches the routed-token work. The default
+                # path keeps the faster host-driven grouped GEMM, which is not
+                # capturable. `set_device` is a host call that is fine eagerly but
+                # is skipped under capture (the device context is already set).
+                if getattr(self, "capture_safe", False):
+                    output = ops.experts_static(
+                        x_flat,
+                        router_indices,
+                        routing_weights_flat,
+                        gate_up,
+                        gate_up_bias,
+                        down_proj,
+                        self.experts.down_proj_bias,
+                        expert_capacity,
+                        num_experts,
+                        top_k,
+                    )
+                else:
+                    torch.cuda.set_device(hidden_states.device)
+                    output = ops.experts(
+                        x_flat,
+                        router_indices,
+                        routing_weights_flat,
+                        gate_up,
+                        gate_up_bias,
+                        down_proj,
+                        self.experts.down_proj_bias,
+                        expert_capacity,
+                        num_experts,
+                        top_k,
+                    )
 
         if timing:
             torch.cuda.synchronize()
