@@ -1,32 +1,45 @@
 # /// script
-# requires-python = "==3.10"
+# requires-python = ">=3.12"
 # dependencies = [
-#   "torch==2.8.0",
 #   "transformers>=4.55.0",
 #   "accelerate",
 #   "triton",
 #   "numpy",
-#   "kernels==0.15.2",
+#   "kernels==0.14.0",
+#   "torch==2.11.0",
 # ]
+#
 # [[tool.uv.index]]
-# name = "pytorch-cu129"
-# url = "https://download.pytorch.org/whl/cu129"
+# name = "pytorch-cu128"
+# url = "https://download.pytorch.org/whl/cu128"
 # explicit = true
+#
 # [tool.uv.sources]
-# torch = [{ index = "pytorch-cu129" }]
+# torch = { index = "pytorch-cu128" }
 # ///
+
+from pathlib import Path
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, Mxfp4Config
-from kernels import LayerRepository, Mode, kernelize, use_kernel_mapping
+from kernels import (
+    LayerRepository,
+    LocalLayerRepository,
+    Mode,
+    kernelize,
+    use_kernel_mapping,
+)
 
 num_layers = 24
 
-# Fetch the yamoe layer from the Hub and map it onto gpt-oss's MoE block.
+# Load the yamoe layer
+repo_root = Path(__file__).resolve().parent.parent
+# layer = LocalLayerRepository(
+    # repo_path=repo_root / "result",
 layer = LayerRepository(
     repo_id="drbh/yamoe",
+    revision=1,
     layer_name="Yamoe",
-    revision="main",
 )
 mapping = {"MegaBlocksMoeMLP": {"cuda": layer}}
 
@@ -57,6 +70,8 @@ with use_kernel_mapping(mapping):
     model = kernelize(model, mode=Mode.INFERENCE)
 
 with torch.no_grad():
-    yamoe_logits = model(**inputs).logits.float()
+    generated = model.generate(**inputs, max_new_tokens=64, do_sample=False)
 
-print(yamoe_logits)
+# Strip the prompt and decode only the newly generated tokens.
+new_tokens = generated[0, inputs["input_ids"].shape[1] :]
+print(tokenizer.decode(new_tokens, skip_special_tokens=True))

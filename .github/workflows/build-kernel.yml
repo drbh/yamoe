@@ -6,6 +6,8 @@ on:
     paths:
       - "csrc/**"
       - "torch-ext/**"
+      - flake.nix
+      - flake.lock
   workflow_dispatch:
     inputs:
       branch:
