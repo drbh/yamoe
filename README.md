@@ -28,9 +28,9 @@ oooo    ooo  .oooo.   ooo. .oo.  .oo.    .ooooo.   .ooooo.
 
 ### Kernel Hub
 
-You can find the kernel on [Kernel Hub](https://huggingface.co/drbh/yamoe) and install it via the [kernels](https://github.com/huggingface/kernels) library.
+You can find the kernel on [Kernel Hub](https://huggingface.co/kernels/drbh/yamoe) and install it via the [kernels](https://github.com/huggingface/kernels) library.
 
 ```python
 from kernels import get_kernel
-yamoe = get_kernel("drbh/yamoe", revision="main")
+yamoe = get_kernel("drbh/yamoe", revision=1)
 ```

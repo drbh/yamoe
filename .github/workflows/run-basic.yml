@@ -5,6 +5,10 @@ name: Run basic
 # Run "Build Kernel" first so the Hub has a fresh kernel to pull.
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - scripts/basic.py
   workflow_dispatch:
 
 jobs:
