@@ -8,6 +8,7 @@ on:
       - "torch-ext/**"
       - flake.nix
       - flake.lock
+      - .github/workflows/build-kernel.yml
   workflow_dispatch:
     inputs:
       branch:
@@ -44,6 +45,5 @@ jobs:
 
             nix run github:huggingface/kernels#kernel-builder -- build-and-upload \
               --max-jobs 4 \
-              --cores 4 \
-              --repo-id drbh/yamoe \
-              --branch "${{ github.event.inputs.branch || 'main' }}"
+              --cores 8 \
+              --repo-id drbh/yamoe
