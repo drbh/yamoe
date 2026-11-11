@@ -13,7 +13,7 @@ TORCH_LIBRARY_EXPAND(
           "Tensor gate_up_proj, "
           "Tensor down_proj, "
           "int threads_up=1024, int cols_up=64, int lanes_up=16, int cw_up=1, "
-          "int threads_down=1024, int cols_down=64, int lanes_down=16, int cw_down=1, int mfma_min=5, float tile_min_rows=4, float tile16_max_rows=24) -> Tensor");
+          "int threads_down=1024, int cols_down=64, int lanes_down=16, int cw_down=1, int mfma_min=5, float tile_min_rows=4, float tile16_max_rows=24, int act_kind=0) -> Tensor");
   ops.impl("fused_experts", torch::kCUDA, &fused_experts);
 
 #ifndef USE_ROCM

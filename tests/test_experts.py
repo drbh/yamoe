@@ -22,15 +22,16 @@ DEVICE = "cuda"
 CFG = (1024, 64, 16, 1, 1024, 64, 16, 1)  # launch config defaults
 
 
-def reference(x, idx, w, w_gu, w_dn):
+def reference(x, idx, w, w_gu, w_dn, activation="silu"):
     """fp32 reference, vectorized per expert."""
+    act = (lambda v: torch.nn.functional.gelu(v, approximate="tanh")) if activation == "gelu_pytorch_tanh" else torch.nn.functional.silu
     T, H = x.shape
     out = torch.zeros(T, H, dtype=torch.float32, device=x.device)
     xf = x.float()
     for e in idx.unique().tolist():
         t, j = (idx == e).nonzero(as_tuple=True)
         g, u = (xf[t] @ w_gu[e].float().T).chunk(2, dim=-1)
-        y = (torch.nn.functional.silu(g) * u) @ w_dn[e].float().T
+        y = (act(g) * u) @ w_dn[e].float().T
         out.index_add_(0, t, y * w[t, j].float().unsqueeze(-1))
     return out
 
@@ -89,6 +90,19 @@ def test_kernel_paths(path, E, H, I, K, T, dtype):
     x, idx, w, w_gu, w_dn = make(T, E, H, I, K, dtype, skew=2.0)
     out = yamoe.ops.fused_experts(x, idx, w, w_gu, w_dn, *CFG, mfma_min, tile_min_rows, tile16_max_rows)
     check(out, reference(x, idx, w, w_gu, w_dn), dtype)
+
+
+# Gemma-4 26B-A4B shape (128 experts, H=2816, I=704, top-8) with its GELU-tanh gate, through every path
+@pytest.mark.parametrize("T", [1, 5, 40, 300, 1000])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_gelu_tanh(T, dtype):
+    x, idx, w, w_gu, w_dn = make(T, 128, 2816, 704, 8, dtype, skew=2.0)
+    ref = reference(x, idx, w, w_gu, w_dn, "gelu_pytorch_tanh")
+    check(yamoe.fused_experts(x, idx, w, w_gu, w_dn, activation="gelu_pytorch_tanh"), ref, dtype)
+    for mfma_min, tile_min_rows, tile16_max_rows in PATHS.values():
+        out = yamoe.ops.fused_experts(x, idx, w, w_gu, w_dn, *CFG, mfma_min, tile_min_rows, tile16_max_rows, 1)
+        check(out, ref, dtype)
+    check(experts_mod._grouped_mm_experts(x, idx, w, w_gu, w_dn, 1), ref, dtype)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])

@@ -1,6 +1,6 @@
 """Experts forward for the transformers experts layout, on CUDA and ROCm.
 
-`fused_experts` is the functional entry point. `experts_forward` matches the transformers
+`fused_experts` is the functional entry point (gate activation SiLU or GELU tanh). `experts_forward` matches the transformers
 `ExpertsInterface` signature, so it can be registered as an experts implementation:
 
     from transformers.integrations.moe import ALL_EXPERTS_FUNCTIONS
@@ -41,6 +41,13 @@ def _defaults():
 
 DEFAULTS = _defaults()
 
+# Gate activations the kernel implements: config name -> kernel id
+ACTIVATIONS = {"silu": 0, "swish": 0, "gelu_pytorch_tanh": 1, "gelu_tanh": 1}
+
+
+def _act_fn(act: int, x: torch.Tensor) -> torch.Tensor:
+    return F.gelu(x, approximate="tanh") if act == 1 else F.silu(x)
+
 
 @torch.library.register_fake(add_op_namespace_prefix("fused_experts"))
 def _fused_experts_fake(hidden_states, top_k_index, top_k_weights, gate_up_proj, down_proj, *args):
@@ -59,7 +66,7 @@ def _grouped_mm(a: torch.Tensor, b: torch.Tensor, offs: torch.Tensor) -> torch.T
     return out
 
 
-def _grouped_mm_experts(hidden_states, top_k_index, top_k_weights, gate_up_proj, down_proj):
+def _grouped_mm_experts(hidden_states, top_k_index, top_k_weights, gate_up_proj, down_proj, act: int = 0):
     """Dense grouped-GEMM path for long prefill, same math and ordering as transformers' grouped_mm forward."""
     T, H = hidden_states.shape
     K = top_k_index.shape[1]
@@ -69,7 +76,7 @@ def _grouped_mm_experts(hidden_states, top_k_index, top_k_weights, gate_up_proj,
     offs = torch.cumsum(torch.histc(ids.int(), bins=E, min=0, max=E - 1), 0, dtype=torch.int32)
     h = _grouped_mm(xs, gate_up_proj.transpose(1, 2), offs)
     gate, up = h.chunk(2, dim=-1)
-    h = _grouped_mm(F.silu(gate) * up, down_proj.transpose(1, 2), offs)
+    h = _grouped_mm(_act_fn(act, gate) * up, down_proj.transpose(1, 2), offs)
     h = h * top_k_weights.reshape(-1)[perm].unsqueeze(-1).to(h.dtype)
     inv_perm = torch.empty_like(perm)
     inv_perm[perm] = torch.arange(perm.numel(), device=perm.device)
@@ -83,11 +90,11 @@ def _use_kernel(num_pairs: int, num_experts: int) -> bool:
     return num_pairs <= d["grouped_mm_min_rows"] * num_experts
 
 
-def _kernel(hidden_states, top_k_index, top_k_weights, gate_up_proj, down_proj):
+def _kernel(hidden_states, top_k_index, top_k_weights, gate_up_proj, down_proj, act: int = 0):
     d = DEFAULTS
     return ops.fused_experts(
         hidden_states, top_k_index, top_k_weights.to(hidden_states.dtype), gate_up_proj, down_proj, *d["cfg"],
-        d["mfma_min"], d["tile_min_rows"], d["tile16_max_rows"],
+        d["mfma_min"], d["tile_min_rows"], d["tile16_max_rows"], act,
     )
 
 
@@ -97,11 +104,25 @@ def fused_experts(
     top_k_weights: torch.Tensor,  # [T, K]
     gate_up_proj: torch.Tensor,  # [E, 2I, H], rows [0, I) gate, [I, 2I) up
     down_proj: torch.Tensor,  # [E, H, I]
+    activation: str = "silu",
 ) -> torch.Tensor:
-    """SiLU-gated experts: sum_k w[t, k] * down[e](silu(gate[e] x) * up[e] x), no bias."""
+    """Gated experts: sum_k w[t, k] * down[e](act(gate[e] x) * up[e] x), no bias. act: silu or gelu_pytorch_tanh."""
+    act = ACTIVATIONS[activation]
     if _use_kernel(top_k_index.numel(), gate_up_proj.shape[0]):
-        return _kernel(hidden_states, top_k_index, top_k_weights, gate_up_proj, down_proj)
-    return _grouped_mm_experts(hidden_states, top_k_index, top_k_weights.to(hidden_states.dtype), gate_up_proj, down_proj)
+        return _kernel(hidden_states, top_k_index, top_k_weights, gate_up_proj, down_proj, act)
+    return _grouped_mm_experts(hidden_states, top_k_index, top_k_weights.to(hidden_states.dtype), gate_up_proj, down_proj, act)
+
+
+_ACT_CLASSES = {"SiLUActivation": "silu", "SiLU": "silu", "GELUTanh": "gelu_pytorch_tanh", "PytorchGELUTanh": "gelu_pytorch_tanh"}
+
+
+def _activation(module):
+    """The gate activation the experts module actually applies (its act_fn), falling back to the config name."""
+    name = _ACT_CLASSES.get(type(getattr(module, "act_fn", None)).__name__)
+    if name is not None:
+        return name
+    cfg = getattr(module, "config", None)
+    return getattr(cfg, "hidden_act", None) or getattr(cfg, "hidden_activation", None)
 
 
 def _supported(module) -> bool:
@@ -112,7 +133,7 @@ def _supported(module) -> bool:
         and getattr(module, "is_concatenated", False)
         and not getattr(module, "has_post_expert_norm", False)
         and not getattr(module, "_is_expert_parallel", False)
-        and getattr(getattr(module, "config", None), "hidden_act", None) == "silu"
+        and _activation(module) in ACTIVATIONS
         and type(module)._apply_gate.__name__ == "_default_apply_gate"
         and module.gate_up_proj.dtype in (torch.bfloat16, torch.float16)
     )
@@ -125,7 +146,9 @@ def experts_forward(module, hidden_states, top_k_index, top_k_weights):
     layouts the kernel does not support, so those cases behave exactly like `experts_implementation="grouped_mm"`.
     """
     if _supported(module) and _use_kernel(top_k_index.numel(), module.gate_up_proj.shape[0]):
-        return _kernel(hidden_states, top_k_index, top_k_weights, module.gate_up_proj, module.down_proj)
+        return _kernel(
+            hidden_states, top_k_index, top_k_weights, module.gate_up_proj, module.down_proj, ACTIVATIONS[_activation(module)]
+        )
     from transformers.integrations.moe import grouped_mm_experts_forward
 
     return grouped_mm_experts_forward(module, hidden_states, top_k_index, top_k_weights)

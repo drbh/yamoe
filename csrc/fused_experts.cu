@@ -5,7 +5,8 @@
 //   gate_up_proj [E, 2I, H]   rows [0, I) gate, [I, 2I) up
 //   down_proj    [E, H, I]
 //
-//   out[t] = sum_k w[t, k] * down[e](silu(gate[e] x[t]) * up[e] x[t]),   e = top_k_index[t, k]
+//   out[t] = sum_k w[t, k] * down[e](act(gate[e] x[t]) * up[e] x[t]),   e = top_k_index[t, k]
+//   act = SiLU (Qwen, Kimi, OLMoE, ...) or GELU tanh (Gemma 4)
 //
 // Every path runs the same four steps, with no host sync and static launch sizes (CUDA-graph capturable):
 //   1. align:   bucket (token, expert) pairs per expert into fixed-row blocks (one CTA, device only)
@@ -68,6 +69,14 @@ __device__ __forceinline__ float dot8(const float a[8], const float b[8]) {
 #pragma unroll
   for (int i = 0; i < 8; ++i) s = fmaf(a[i], b[i], s);
   return s;
+}
+
+// Gate activation, picked at runtime (uniform branch): 0 = SiLU, 1 = GELU with the tanh approximation.
+constexpr int kActSilu = 0;
+constexpr int kActGeluTanh = 1;
+__device__ __forceinline__ float gate_act(float g, int act) {
+  if (act == kActGeluTanh) return 0.5f * g * (1.f + tanhf(0.7978845608028654f * (g + 0.044715f * g * g * g)));
+  return g / (1.f + __expf(-g));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -188,7 +197,7 @@ __device__ __forceinline__ void frag_coord(int q, int& row, int& col) {
 template <typename scalar_t>
 __device__ __forceinline__ void gate_up_mma(const scalar_t* xs, const scalar_t* __restrict__ wg_e,
                                             scalar_t* __restrict__ act, const int* pairs, int m, int H, int I,
-                                            int c0, int c1) {
+                                            int c0, int c1, int act_fn) {
   const int wave = threadIdx.x / kWarp, nwaves = blockDim.x / kWarp;
   const uint4 zero = make_uint4(0, 0, 0, 0);
   auto lda = [&](int row, int k) { return row < m ? ld16(xs + row * H + k) : zero; };
@@ -211,7 +220,7 @@ __device__ __forceinline__ void gate_up_mma(const scalar_t* xs, const scalar_t* 
       frag_coord(q, row, col);
       if (row < m && cb + col < c1) {
         const float gv = ag[q], uv = au[q];
-        act[(int64_t)pairs[row] * I + cb + col] = static_cast<scalar_t>(gv / (1.f + __expf(-gv)) * uv);
+        act[(int64_t)pairs[row] * I + cb + col] = static_cast<scalar_t>(gate_act(gv, act_fn) * uv);
       }
     }
   }
@@ -271,7 +280,7 @@ template <typename scalar_t, bool GATED, int TM, int BK>
 __global__ void __launch_bounds__(kTileThreads) moe_tile_kernel(
     const scalar_t* __restrict__ a_src, const scalar_t* __restrict__ w, scalar_t* __restrict__ out,
     const scalar_t* __restrict__ rw, const int* __restrict__ perm, const int* __restrict__ blk_expert,
-    const int* __restrict__ blk_row, const int* __restrict__ blk_end, int N, int Kd, int adiv, int E) {
+    const int* __restrict__ blk_row, const int* __restrict__ blk_end, int N, int Kd, int adiv, int E, int act_fn) {
   constexpr int TN = tile_n<TM>();
   constexpr int WM = tile_wm<TM>(), WN = tile_wn<TM>();
   constexpr int FI = WM / 16, FJ = WN / 16;
@@ -387,7 +396,7 @@ __global__ void __launch_bounds__(kTileThreads) moe_tile_kernel(
           float v;
           if (GATED) {
             const float gv = ag[i][j][q], uv = au[i][j][q];
-            v = gv / (1.f + __expf(-gv)) * uv;
+            v = gate_act(gv, act_fn) * uv;
           } else {
             v = ag[i][j][q] * static_cast<float>(rw[p]);
           }
@@ -489,7 +498,7 @@ __device__ __forceinline__ int block_rows(const int* __restrict__ perm, const in
 template <typename scalar_t, int M, int LANES, int COLS>
 __device__ __forceinline__ void gate_up_cols(const scalar_t* xs, const scalar_t* __restrict__ wg_e,
                                              scalar_t* __restrict__ act, const int* pairs, int m,
-                                             int H, int I, int c0, int c1) {
+                                             int H, int I, int c0, int c1, int act_fn) {
   // Each group of LANES lanes computes COLS adjacent output columns at once, so every activation
   // vector read from shared memory is reused COLS times (matters when M > 1).
   const int group = threadIdx.x / LANES, lane = threadIdx.x % LANES;
@@ -534,7 +543,7 @@ __device__ __forceinline__ void gate_up_cols(const scalar_t* xs, const scalar_t*
         const float g = group_sum<LANES>(ag[j][r]);
         const float u = group_sum<LANES>(au[j][r]);
         if (lane == 0 && r < m && cb + j < c1)
-          act[(int64_t)pairs[r] * I + cb + j] = static_cast<scalar_t>(g / (1.f + __expf(-g)) * u);
+          act[(int64_t)pairs[r] * I + cb + j] = static_cast<scalar_t>(gate_act(g, act_fn) * u);
       }
   }
 }
@@ -543,7 +552,8 @@ template <typename scalar_t, int LANES, int CW>
 __global__ void __launch_bounds__(kMaxThreads) gate_up_silu_kernel(
     const scalar_t* __restrict__ x, const scalar_t* __restrict__ w, scalar_t* __restrict__ act,
     const int* __restrict__ perm, const int* __restrict__ blk_expert, const int* __restrict__ blk_row,
-    const int* __restrict__ blk_end, int H, int I, int topk, int E, int bm, int cols, int mfma_min) {
+    const int* __restrict__ blk_end, int H, int I, int topk, int E, int bm, int cols, int mfma_min,
+    int act_fn) {
   extern __shared__ __align__(16) unsigned char smem_raw[];
   scalar_t* xs = reinterpret_cast<scalar_t*>(smem_raw);
   __shared__ int pairs[kMaxM], toks[kMaxM];
@@ -561,13 +571,13 @@ __global__ void __launch_bounds__(kMaxThreads) gate_up_silu_kernel(
   const int c0 = blockIdx.y * cols, c1 = min(I, c0 + cols);
   const scalar_t* wg_e = w + (int64_t)e * 2 * I * H;
   if (m >= mfma_min && H % 32 == 0) {
-    gate_up_mma<scalar_t>(xs, wg_e, act, pairs, m, H, I, c0, c1);
+    gate_up_mma<scalar_t>(xs, wg_e, act, pairs, m, H, I, c0, c1, act_fn);
     return;
   }
-  if (m == 1)      gate_up_cols<scalar_t, 1, LANES, 1>(xs, wg_e, act, pairs, m, H, I, c0, c1);
-  else if (m == 2) gate_up_cols<scalar_t, 2, LANES, CW>(xs, wg_e, act, pairs, m, H, I, c0, c1);
-  else if (m <= 4) gate_up_cols<scalar_t, 4, LANES, CW>(xs, wg_e, act, pairs, m, H, I, c0, c1);
-  else             gate_up_cols<scalar_t, kMaxM, LANES, CW>(xs, wg_e, act, pairs, m, H, I, c0, c1);
+  if (m == 1)      gate_up_cols<scalar_t, 1, LANES, 1>(xs, wg_e, act, pairs, m, H, I, c0, c1, act_fn);
+  else if (m == 2) gate_up_cols<scalar_t, 2, LANES, CW>(xs, wg_e, act, pairs, m, H, I, c0, c1, act_fn);
+  else if (m <= 4) gate_up_cols<scalar_t, 4, LANES, CW>(xs, wg_e, act, pairs, m, H, I, c0, c1, act_fn);
+  else             gate_up_cols<scalar_t, kMaxM, LANES, CW>(xs, wg_e, act, pairs, m, H, I, c0, c1, act_fn);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -657,7 +667,7 @@ __global__ void topk_sum_kernel(const scalar_t* __restrict__ y, scalar_t* __rest
 }
 
 struct Launch {
-  int threads, cols, lanes, cw, mfma_min;
+  int threads, cols, lanes, cw, mfma_min, act;
 };
 
 // Dispatch runtime (lanes, cw) onto template instances.
@@ -686,7 +696,7 @@ void launch_all(const torch::Tensor& x, const torch::Tensor& wgu, const torch::T
 #define YAMOE_UP(L)                                                                                          \
   gate_up_silu_kernel<scalar_t, L, CWV><<<grid_up, up.threads, smem_up, stream>>>(                                \
       x.data_ptr<scalar_t>(), wgu.data_ptr<scalar_t>(), act.data_ptr<scalar_t>(), perm.data_ptr<int>(),      \
-      blk_expert, blk_row, blk_end, H, I, K, E, bm, up.cols, up.mfma_min)
+      blk_expert, blk_row, blk_end, H, I, K, E, bm, up.cols, up.mfma_min, up.act)
   YAMOE_SWITCH(up, YAMOE_UP);
 #undef YAMOE_UP
 
@@ -713,7 +723,7 @@ torch::Tensor fused_experts(torch::Tensor const& hidden_states,  // [T, H]
                             torch::Tensor const& down_proj,      // [E, H, I]
                             int64_t threads_up, int64_t cols_up, int64_t lanes_up, int64_t cw_up, int64_t threads_down,
                             int64_t cols_down, int64_t lanes_down, int64_t cw_down, int64_t mfma_min,
-                            double tile_min_rows, double tile16_max_rows) {
+                            double tile_min_rows, double tile16_max_rows, int64_t act_kind) {
   TORCH_CHECK(hidden_states.is_cuda() && hidden_states.dim() == 2, "hidden_states must be a 2D GPU tensor");
   TORCH_CHECK(gate_up_proj.dim() == 3 && down_proj.dim() == 3, "expert weights must be 3D");
   TORCH_CHECK(hidden_states.scalar_type() == gate_up_proj.scalar_type() &&
@@ -726,6 +736,7 @@ torch::Tensor fused_experts(torch::Tensor const& hidden_states,  // [T, H]
                   down_proj.size(2) == I,
               "expected gate_up_proj [E, 2I, H] and down_proj [E, H, I]");
   TORCH_CHECK(E <= kMaxExperts, "at most ", kMaxExperts, " experts supported");
+  TORCH_CHECK(act_kind == kActSilu || act_kind == kActGeluTanh, "act_kind must be 0 (silu) or 1 (gelu tanh)");
   TORCH_CHECK(H % 8 == 0 && I % 8 == 0, "H and I must be multiples of 8");
   // Rows per block: largest power of two <= kMaxM whose staging buffer fits the budget.
   const int64_t row_bytes = (int64_t)std::max(H, I) * hidden_states.element_size();
@@ -778,10 +789,10 @@ torch::Tensor fused_experts(torch::Tensor const& hidden_states,  // [T, H]
         const dim3 grid_up(tb, (I + TN - 1) / TN), grid_dn(tb, (H + TN - 1) / TN);
         moe_tile_kernel<scalar_t, true, TMV, BKV><<<grid_up, kTileThreads, 0, stream>>>(
             x.data_ptr<scalar_t>(), wgu.data_ptr<scalar_t>(), act_t.data_ptr<scalar_t>(), nullptr,
-            perm_t.data_ptr<int>(), be, br, bn, I, H, K, E);
+            perm_t.data_ptr<int>(), be, br, bn, I, H, K, E, (int)act_kind);
         moe_tile_kernel<scalar_t, false, TMV, BKV><<<grid_dn, kTileThreads, 0, stream>>>(
             act_t.data_ptr<scalar_t>(), wd.data_ptr<scalar_t>(), y_t.data_ptr<scalar_t>(), rw.data_ptr<scalar_t>(),
-            perm_t.data_ptr<int>(), be, br, bn, H, I, 1, E);
+            perm_t.data_ptr<int>(), be, br, bn, H, I, 1, E, (int)act_kind);
       };
       if (tm == 16 && H % 64 == 0 && I % 64 == 0) launch(std::integral_constant<int, 16>{}, std::integral_constant<int, 64>{});
       else if (tm == 16) launch(std::integral_constant<int, 16>{}, std::integral_constant<int, 32>{});
@@ -808,8 +819,8 @@ torch::Tensor fused_experts(torch::Tensor const& hidden_states,  // [T, H]
   auto act = torch::empty({S, I}, x.options());
   auto y = torch::empty({S, H}, x.options());
   auto out = torch::empty({T, H}, x.options());
-  const Launch up{(int)threads_up, (int)cols_up, (int)lanes_up, (int)cw_up, (int)mfma_min};
-  const Launch dn{(int)threads_down, (int)cols_down, (int)lanes_down, (int)cw_down, (int)mfma_min};
+  const Launch up{(int)threads_up, (int)cols_up, (int)lanes_up, (int)cw_up, (int)mfma_min, (int)act_kind};
+  const Launch dn{(int)threads_down, (int)cols_down, (int)lanes_down, (int)cw_down, (int)mfma_min, (int)act_kind};
 
   if (x.scalar_type() == at::kBFloat16) {
     launch_all<at::BFloat16>(x, wgu, wd, rw, act, y, out, perm, blk_expert, blk_row, blk_end, T, H, I, K, E,
