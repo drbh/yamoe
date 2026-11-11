@@ -57,16 +57,35 @@ Unsupported layouts (bias, transposed or interleaved weights, other activations)
 
 The kernel picks a path from the average number of tokens per expert:
 
-- decode: a GEMV kernel that streams only the active experts' weights, with an MFMA tile on ROCm for experts that get several tokens
-- prefill (ROCm): 16-row and 64-row MFMA grouped GEMM tiles staged through LDS
-- long prefill, and anything past decode on CUDA: `torch.nn.functional.grouped_mm`
+- decode: a GEMV kernel that streams only the active experts' weights, with a matrix-core tile for experts that get several tokens (ROCm)
+- prefill: 16-row and 64-row matrix-core grouped GEMM tiles staged through shared memory, MFMA on ROCm and `mma.sync` on CUDA sm80+
+- long prefill: `torch.nn.functional.grouped_mm` (hipBLASLt / CUTLASS), earlier on Hopper and Blackwell where CUTLASS is fast
 
-Qwen3-30B-A3B on MI300X, bf16, compared to `experts_implementation="grouped_mm"`:
+Thresholds and launch configs are per backend in `torch-ext/yamoe/experts.py`. tok/s compared to `experts_implementation="grouped_mm"`, bf16:
+
+Qwen3-30B-A3B on MI300X
 
 | | grouped_mm | yamoe |
 |---|---|---|
-| prefill 128 / 512 / 2048 tokens (tok/s) | 603 / 2266 / 8044 | 3268 / 11393 / 21324 |
-| decode, static cache + compile, batch 1 / 4 / 16 / 64 (tok/s) | 87 / 199 / 276 / 312 | 103 / 320 / 858 / 1360 |
-| decode, eager, batch 1 / 16 (tok/s) | 23 / 294 | 26 / 396 |
+| prefill 128 / 512 / 2048 / 8192 tokens | 619 / 2233 / 8238 / 20052 | 3350 / 11943 / 22687 / 21763 |
+| decode, static cache + compile, batch 1 / 4 / 16 / 64 | 87 / 197 / 276 / 321 | 103 / 322 / 874 / 1709 |
+| decode, eager, batch 1 / 16 | 23 / 294 | 26 / 414 |
+
+Qwen3-30B-A3B on B200
+
+| | grouped_mm | yamoe |
+|---|---|---|
+| prefill 128 tokens (wall, launch bound) | 41.7 ms | 27.6 ms |
+| prefill 512+ tokens | same | same |
+| decode, static cache + compile, batch 1 / 4 / 16 / 64 | 135 / 290 / 425 / 503 | 150 / 429 / 969 / 1978 |
+| decode, eager, batch 1 / 16 | 30 / 392 | 37 / 581 |
+
+OLMoE-1B-7B on RTX 4090
+
+| | grouped_mm | yamoe |
+|---|---|---|
+| prefill 128 / 512 / 2048 / 8192 tokens | 4963 / 16193 / 31795 / 33351 | 7960 / 24836 / 40516 / 33340 |
+| decode, static cache + compile, batch 1 / 4 / 16 | 174 / 171 / 185 | 249 / 582 / 1509 |
+| decode, eager, batch 1 / 16 | 124 / 228 | 154 / 1150 |
 
 Tests: `YAMOE_BUILD=/path/to/dir/with/build pytest tests/test_experts.py`

@@ -15,12 +15,31 @@ from ._ops import add_op_namespace_prefix, ops
 
 IS_ROCM = torch.version.hip is not None
 
-# The C++ op picks its own path from the average rows per expert (S / E): a GEMV / MFMA decode kernel, then
-# 16-row and 64-row matrix-core tiles (ROCm). Past these limits a dense grouped GEMM is faster.
-#   ROCm: tiles are used up to GROUPED_MM_MIN_ROWS rows per expert, then hipBLASLt grouped_mm (long prefill).
-#   CUDA: no tile path yet, so the decode kernel is used up to CUDA_SMALL_MAX_PAIRS pairs, then grouped_mm.
-GROUPED_MM_MIN_ROWS = 384
-CUDA_SMALL_MAX_PAIRS = 256  # B200: decode kernel wins up to ~32 tokens at top-8, CUTLASS grouped_mm above
+
+def _defaults():
+    """Per-backend dispatch and launch defaults, tuned on MI300X (ROCm), B200 (sm100) and RTX 4090 (sm89).
+
+    The C++ op picks its path from the average rows per expert (S / E, S = T * K pairs):
+      GEMV decode kernel (matrix-core tile for blocks with >= mfma_min rows) below tile_min_rows,
+      16-row matrix-core tiles up to tile16_max_rows, 64-row tiles above.
+    Past grouped_mm_min_rows a dense grouped GEMM (hipBLASLt / CUTLASS) is faster, so we hand off.
+    """
+    if IS_ROCM:
+        return dict(cfg=(1024, 64, 16, 1, 1024, 64, 16, 1), mfma_min=5, tile_min_rows=1.0, tile16_max_rows=24.0,
+                    grouped_mm_min_rows=384.0, small_max_pairs=None)
+    major = torch.cuda.get_device_capability()[0] if torch.cuda.is_available() else 0
+    cfg = (512, 32, 16, 1, 512, 128, 8, 2)
+    if major >= 9:  # Hopper / Blackwell: mma.sync tiles, CUTLASS grouped_mm is fast from ~16 rows per expert
+        return dict(cfg=cfg, mfma_min=1 << 20, tile_min_rows=2.0, tile16_max_rows=float(1 << 30),
+                    grouped_mm_min_rows=16.0, small_max_pairs=None)
+    if major == 8:  # Ampere / Ada: grouped_mm has no fast path, our tiles win until long prefill
+        return dict(cfg=cfg, mfma_min=1 << 20, tile_min_rows=0.5, tile16_max_rows=128.0,
+                    grouped_mm_min_rows=384.0, small_max_pairs=None)
+    return dict(cfg=(512, 32, 16, 1, 512, 128, 8, 2), mfma_min=1 << 20, tile_min_rows=float(1 << 30),
+                tile16_max_rows=float(1 << 30), grouped_mm_min_rows=None, small_max_pairs=256)
+
+
+DEFAULTS = _defaults()
 
 
 @torch.library.register_fake(add_op_namespace_prefix("fused_experts"))
@@ -41,7 +60,7 @@ def _grouped_mm(a: torch.Tensor, b: torch.Tensor, offs: torch.Tensor) -> torch.T
 
 
 def _grouped_mm_experts(hidden_states, top_k_index, top_k_weights, gate_up_proj, down_proj):
-    """Dense grouped-GEMM path for long prefill (and the CUDA fallback)."""
+    """Dense grouped-GEMM path for long prefill, same math and ordering as transformers' grouped_mm forward."""
     T, H = hidden_states.shape
     K = top_k_index.shape[1]
     E = gate_up_proj.shape[0]
@@ -52,9 +71,24 @@ def _grouped_mm_experts(hidden_states, top_k_index, top_k_weights, gate_up_proj,
     gate, up = h.chunk(2, dim=-1)
     h = _grouped_mm(F.silu(gate) * up, down_proj.transpose(1, 2), offs)
     h = h * top_k_weights.reshape(-1)[perm].unsqueeze(-1).to(h.dtype)
-    y = torch.empty_like(h)
-    y[perm] = h
-    return y.view(T, K, H).sum(dim=1, dtype=torch.float32).to(hidden_states.dtype)
+    inv_perm = torch.empty_like(perm)
+    inv_perm[perm] = torch.arange(perm.numel(), device=perm.device)
+    return h[inv_perm].view(T, K, H).sum(dim=1).to(hidden_states.dtype)
+
+
+def _use_kernel(num_pairs: int, num_experts: int) -> bool:
+    d = DEFAULTS
+    if d["small_max_pairs"] is not None:
+        return num_pairs <= d["small_max_pairs"]
+    return num_pairs <= d["grouped_mm_min_rows"] * num_experts
+
+
+def _kernel(hidden_states, top_k_index, top_k_weights, gate_up_proj, down_proj):
+    d = DEFAULTS
+    return ops.fused_experts(
+        hidden_states, top_k_index, top_k_weights.to(hidden_states.dtype), gate_up_proj, down_proj, *d["cfg"],
+        d["mfma_min"], d["tile_min_rows"], d["tile16_max_rows"],
+    )
 
 
 def fused_experts(
@@ -65,16 +99,9 @@ def fused_experts(
     down_proj: torch.Tensor,  # [E, H, I]
 ) -> torch.Tensor:
     """SiLU-gated experts: sum_k w[t, k] * down[e](silu(gate[e] x) * up[e] x), no bias."""
-    weights = top_k_weights.to(hidden_states.dtype)
-    S = top_k_index.numel()
-    E = gate_up_proj.shape[0]
-    if IS_ROCM:
-        use_kernel = S <= GROUPED_MM_MIN_ROWS * E
-    else:
-        use_kernel = S <= CUDA_SMALL_MAX_PAIRS
-    if use_kernel:
-        return ops.fused_experts(hidden_states, top_k_index, weights, gate_up_proj, down_proj)
-    return _grouped_mm_experts(hidden_states, top_k_index, weights, gate_up_proj, down_proj)
+    if _use_kernel(top_k_index.numel(), gate_up_proj.shape[0]):
+        return _kernel(hidden_states, top_k_index, top_k_weights, gate_up_proj, down_proj)
+    return _grouped_mm_experts(hidden_states, top_k_index, top_k_weights.to(hidden_states.dtype), gate_up_proj, down_proj)
 
 
 def _supported(module) -> bool:
@@ -92,9 +119,13 @@ def _supported(module) -> bool:
 
 
 def experts_forward(module, hidden_states, top_k_index, top_k_weights):
-    """transformers `ExpertsInterface` forward; falls back to grouped_mm for unsupported layouts."""
-    if not _supported(module):
-        from transformers.integrations.moe import grouped_mm_experts_forward
+    """transformers `ExpertsInterface` forward.
 
-        return grouped_mm_experts_forward(module, hidden_states, top_k_index, top_k_weights)
-    return fused_experts(hidden_states, top_k_index, top_k_weights, module.gate_up_proj, module.down_proj)
+    Uses the yamoe kernel where it is faster, and transformers' own grouped_mm forward for long prefill and for
+    layouts the kernel does not support, so those cases behave exactly like `experts_implementation="grouped_mm"`.
+    """
+    if _supported(module) and _use_kernel(top_k_index.numel(), module.gate_up_proj.shape[0]):
+        return _kernel(hidden_states, top_k_index, top_k_weights, module.gate_up_proj, module.down_proj)
+    from transformers.integrations.moe import grouped_mm_experts_forward
+
+    return grouped_mm_experts_forward(module, hidden_states, top_k_index, top_k_weights)
