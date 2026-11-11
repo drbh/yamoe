@@ -105,6 +105,40 @@ def test_gelu_tanh(T, dtype):
     check(experts_mod._grouped_mm_experts(x, idx, w, w_gu, w_dn, 1), ref, dtype)
 
 
+def make_fp8(E, N, Kd, g, bn=128, bk=128):
+    """Random e4m3fn weights with fp32 block scales, and their fp32 dequantization."""
+    w = (torch.randn(E, N, Kd, device=DEVICE, generator=g) * 0.6).to(torch.float8_e4m3fn)
+    s = torch.rand(E, (N + bn - 1) // bn, (Kd + bk - 1) // bk, device=DEVICE, generator=g) * 0.04 + 0.01
+    return w, s, w.float() * s.repeat_interleave(bn, 1)[:, :N].repeat_interleave(bk, 2)[:, :, :Kd]
+
+
+# FP8 weights (weight-only dequant) through every path, incl. a block size that does not divide the dims evenly
+@pytest.mark.parametrize("path", list(PATHS))
+@pytest.mark.parametrize("E,H,I,K,bn,bk", [(256, 2048, 512, 8, 128, 128), (32, 384, 256, 4, 128, 128), (16, 160, 96, 2, 64, 32)])
+@pytest.mark.parametrize("T", [1, 5, 64, 300])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_fp8_weights(path, E, H, I, K, bn, bk, T, dtype):
+    g = torch.Generator(DEVICE).manual_seed(T)
+    wgu, sgu, dgu = make_fp8(E, 2 * I, H, g, bn, bk)
+    wdn, sdn, ddn = make_fp8(E, H, I, g, bn, bk)
+    x, idx, w, _, _ = make(T, E, H, I, K, dtype, skew=2.0)
+    ref = reference(x, idx, w, dgu, ddn)
+    mfma_min, tile_min_rows, tile16_max_rows = PATHS[path]
+    out = yamoe.ops.fused_experts(x, idx, w, wgu, wdn, *CFG, mfma_min, tile_min_rows, tile16_max_rows, 0, sgu, sdn, bn, bk)
+    check(out, ref, dtype)
+    if path == "decode_gemv":
+        check(yamoe.fused_experts(x, idx, w, wgu, wdn, gate_up_scale=sgu, down_scale=sdn, block_size=(bn, bk)), ref, dtype)
+
+
+def test_fp8_requires_scales():
+    g = torch.Generator(DEVICE).manual_seed(0)
+    wgu, _, _ = make_fp8(8, 64, 64, g)
+    wdn, _, _ = make_fp8(8, 64, 32, g)
+    x, idx, w, _, _ = make(2, 8, 64, 32, 2, torch.bfloat16)
+    with pytest.raises(RuntimeError, match="scale"):
+        yamoe.ops.fused_experts(x, idx, w, wgu, wdn)
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_grouped_mm_fallback(dtype):
     x, idx, w, w_gu, w_dn = make(700, 32, 256, 128, 4, dtype)

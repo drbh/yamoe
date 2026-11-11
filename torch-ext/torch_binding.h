@@ -12,7 +12,8 @@ torch::Tensor fused_experts(torch::Tensor const &hidden_states, // [T, H]
                             int64_t cw_up, int64_t threads_down, int64_t cols_down,
                             int64_t lanes_down, int64_t cw_down, int64_t mfma_min,
                             double tile_min_rows, double tile16_max_rows,
-                            int64_t act_kind);
+                            int64_t act_kind, c10::optional<torch::Tensor> const &gate_up_scale,
+                            c10::optional<torch::Tensor> const &down_scale, int64_t block_n, int64_t block_k);
 
 #ifndef USE_ROCM
 // The ops below use cuBLAS / CUTLASS and are CUDA only.

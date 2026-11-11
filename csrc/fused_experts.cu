@@ -23,6 +23,7 @@
 // Matrix cores: MFMA 16x16x16 on ROCm, mma.sync m16n8k16 on CUDA sm80+ (older GPUs use the GEMV path only).
 
 #include <ATen/cuda/CUDAContext.h>
+#include <cuda_fp16.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/all.h>
 
@@ -96,6 +97,95 @@ __device__ __forceinline__ float gate_act(float g, int act) {
 // A and B always use the same k mapping, so the reduction is exact. Rows past the expert's count load zeros.
 // ---------------------------------------------------------------------------------------------
 __device__ __forceinline__ uint4 ld16(const void* p) { return *reinterpret_cast<const uint4*>(p); }
+
+// ---------------------------------------------------------------------------------------------
+// Expert weight access. Weights are either the activation dtype (bf16 / f16) or FP8 e4m3fn with
+// per-block fp32 scales [E, ceil(N / bn), ceil(K / bk)] (the transformers / DeepSeek fine-grained
+// layout). FP8 is dequantized on load (weight-only, activations stay bf16 / f16):
+//   e4m3fn bits s.eeee.mmm placed at fp32 bits 31 / 26..20 give 2^(e-127) * 1.m, so * 2^120 restores
+//   2^(e-7) * 1.m; subnormals (e = 0) map to fp32 subnormals and come out exact the same way.
+// ---------------------------------------------------------------------------------------------
+struct WSrc {
+  const void* w;   // [E, N, K]
+  const float* s;  // FP8 block scales, else nullptr
+  int sN, sK, bn, bk;
+};
+
+// Four e4m3fn bytes -> four floats equal to value / 256. Two bytes at a time become an fp16 pair with
+// three integer ops (sign to bit 15, exponent and mantissa shifted into fp16 position), then the hardware
+// fp16 -> fp32 conversion handles normals and subnormals exactly; fp16's exponent bias is 8 larger.
+__device__ __forceinline__ void fp8x4_div256(unsigned w, float* out) {
+  const unsigned a = ((w & 0x00800080u) << 8) | ((w & 0x007F007Fu) << 7);  // bytes 0, 2
+  const unsigned b = (w & 0x80008000u) | ((w & 0x7F007F00u) >> 1);         // bytes 1, 3
+  const float2 fa = __half22float2(*reinterpret_cast<const __half2*>(&a));
+  const float2 fb = __half22float2(*reinterpret_cast<const __half2*>(&b));
+  out[0] = fa.x, out[1] = fb.x, out[2] = fa.y, out[3] = fb.y;
+}
+
+__device__ __forceinline__ void fp8x8_to_float(uint2 raw, float scale, float out[8]) {
+  fp8x4_div256(raw.x, out);
+  fp8x4_div256(raw.y, out + 4);
+  const float sc = scale * 256.f;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) out[i] *= sc;
+}
+
+template <typename scalar_t>
+__device__ __forceinline__ uint4 pack8(const float f[8]) {
+  uint4 r;
+  scalar_t* o = reinterpret_cast<scalar_t*>(&r);
+#pragma unroll
+  for (int i = 0; i < 8; ++i) o[i] = static_cast<scalar_t>(f[i]);
+  return r;
+}
+
+// One expert's [N, K] weight matrix.
+template <typename scalar_t, bool FP8>
+struct WExp {
+  const unsigned char* w;
+  const float* s;
+  int K, sK, bn, bk;
+  __device__ __forceinline__ float scale(int n, int k) const { return s[(n / bn) * sK + k / bk]; }
+  // 8 consecutive weights of row n starting at k, as fp32
+  __device__ __forceinline__ void load8f(int n, int k, float out[8]) const {
+    if constexpr (FP8)
+      fp8x8_to_float(*reinterpret_cast<const uint2*>(w + (int64_t)n * K + k), scale(n, k), out);
+    else
+      load8(reinterpret_cast<const scalar_t*>(w) + (int64_t)n * K + k, out);
+  }
+  // FP8 only: 16 consecutive weights of row n from k (16-byte load) as value / 256, and the block scale * 256.
+  // 16 | block_k, so the chunk shares one scale.
+  __device__ __forceinline__ float load16u(int n, int k, float out[16]) const {
+    const uint4 raw = *reinterpret_cast<const uint4*>(w + (int64_t)n * K + k);
+    fp8x4_div256(raw.x, out);
+    fp8x4_div256(raw.y, out + 4);
+    fp8x4_div256(raw.z, out + 8);
+    fp8x4_div256(raw.w, out + 12);
+    return scale(n, k) * 256.f;
+  }
+  // FP8 only: raw 8 bytes and the block scale, for loaders that dequantize later (latency hiding)
+  __device__ __forceinline__ uint2 raw8(int n, int k) const { return *reinterpret_cast<const uint2*>(w + (int64_t)n * K + k); }
+  // the same 8 weights packed as scalar_t (matrix-core operand)
+  __device__ __forceinline__ uint4 load8p(int n, int k) const {
+    if constexpr (FP8) {
+      float f[8];
+      load8f(n, k, f);
+      return pack8<scalar_t>(f);
+    } else {
+      return ld16(reinterpret_cast<const scalar_t*>(w) + (int64_t)n * K + k);
+    }
+  }
+};
+
+template <typename scalar_t, bool FP8>
+__device__ __forceinline__ WExp<scalar_t, FP8> expert_w(const WSrc& src, int e, int N, int K) {
+  WExp<scalar_t, FP8> r;
+  const int64_t esz = FP8 ? 1 : sizeof(scalar_t);
+  r.w = reinterpret_cast<const unsigned char*>(src.w) + (int64_t)e * N * K * esz;
+  r.s = FP8 ? src.s + (int64_t)e * src.sN * src.sK : nullptr;
+  r.K = K, r.sK = src.sK, r.bn = src.bn, r.bk = src.bk;
+  return r;
+}
 
 #ifdef YAMOE_AMD
 constexpr int kAcc = 4;
@@ -194,18 +284,16 @@ __device__ __forceinline__ void frag_coord(int q, int& row, int& col) {
 // activations come from the shared-memory staging buffer, weights straight from global memory.
 // Requires the reduction dim % 32 == 0.
 // ---------------------------------------------------------------------------------------------
-template <typename scalar_t>
-__device__ __forceinline__ void gate_up_mma(const scalar_t* xs, const scalar_t* __restrict__ wg_e,
+template <typename scalar_t, bool FP8>
+__device__ __forceinline__ void gate_up_mma(const scalar_t* xs, const WExp<scalar_t, FP8>& wgu,
                                             scalar_t* __restrict__ act, const int* pairs, int m, int H, int I,
                                             int c0, int c1, int act_fn) {
   const int wave = threadIdx.x / kWarp, nwaves = blockDim.x / kWarp;
   const uint4 zero = make_uint4(0, 0, 0, 0);
   auto lda = [&](int row, int k) { return row < m ? ld16(xs + row * H + k) : zero; };
   for (int cb = c0 + wave * 16; cb < c1; cb += nwaves * 16) {
-    const scalar_t* wg = wg_e + (int64_t)cb * H;
-    const scalar_t* wu = wg + (int64_t)I * H;
-    auto ldg = [&](int col, int k) { return ld16(wg + (int64_t)min(col, c1 - 1 - cb) * H + k); };
-    auto ldu = [&](int col, int k) { return ld16(wu + (int64_t)min(col, c1 - 1 - cb) * H + k); };
+    auto ldg = [&](int col, int k) { return wgu.load8p(min(cb + col, c1 - 1), k); };
+    auto ldu = [&](int col, int k) { return wgu.load8p(I + min(cb + col, c1 - 1), k); };
     float ag[kAcc] = {}, au[kAcc] = {};
 #pragma unroll 2
     for (int k = 0; k < H; k += 32) {
@@ -226,16 +314,15 @@ __device__ __forceinline__ void gate_up_mma(const scalar_t* xs, const scalar_t* 
   }
 }
 
-template <typename scalar_t>
-__device__ __forceinline__ void down_mma(const scalar_t* as, const scalar_t* __restrict__ wd_e,
+template <typename scalar_t, bool FP8>
+__device__ __forceinline__ void down_mma(const scalar_t* as, const WExp<scalar_t, FP8>& wde,
                                          const scalar_t* __restrict__ rw, scalar_t* __restrict__ y, const int* pairs,
                                          int m, int H, int I, int c0, int c1) {
   const int wave = threadIdx.x / kWarp, nwaves = blockDim.x / kWarp;
   const uint4 zero = make_uint4(0, 0, 0, 0);
   auto lda = [&](int row, int k) { return row < m ? ld16(as + row * I + k) : zero; };
   for (int cb = c0 + wave * 16; cb < c1; cb += nwaves * 16) {
-    const scalar_t* wd = wd_e + (int64_t)cb * I;
-    auto ldw = [&](int col, int k) { return ld16(wd + (int64_t)min(col, c1 - 1 - cb) * I + k); };
+    auto ldw = [&](int col, int k) { return wde.load8p(min(cb + col, c1 - 1), k); };
     float acc[kAcc] = {};
 #pragma unroll 2
     for (int k = 0; k < I; k += 32) frag_mma<scalar_t>(acc, load_a(lda, k), load_b(ldw, k));
@@ -276,9 +363,9 @@ __host__ __device__ constexpr int tile_wn() {
 template <int TM>
 __host__ __device__ constexpr int tile_n() { return (kTileWaves / (TM / tile_wm<TM>())) * tile_wn<TM>(); }
 
-template <typename scalar_t, bool GATED, int TM, int BK>
+template <typename scalar_t, bool FP8, bool GATED, int TM, int BK>
 __global__ void __launch_bounds__(kTileThreads) moe_tile_kernel(
-    const scalar_t* __restrict__ a_src, const scalar_t* __restrict__ w, scalar_t* __restrict__ out,
+    const scalar_t* __restrict__ a_src, const WSrc w, scalar_t* __restrict__ out,
     const scalar_t* __restrict__ rw, const int* __restrict__ perm, const int* __restrict__ blk_expert,
     const int* __restrict__ blk_row, const int* __restrict__ blk_end, int N, int Kd, int adiv, int E, int act_fn) {
   constexpr int TN = tile_n<TM>();
@@ -304,7 +391,7 @@ __global__ void __launch_bounds__(kTileThreads) moe_tile_kernel(
   __syncthreads();
 
   const int n_base = blockIdx.y * TN;
-  const scalar_t* w_e = w + (int64_t)e * (GATED ? 2 : 1) * N * Kd;
+  const auto W = expert_w<scalar_t, FP8>(w, e, (GATED ? 2 : 1) * N, Kd);
   const uint4 zero = make_uint4(0, 0, 0, 0);
   // loader: chunk id c -> (row c / CPR, k offset (c % CPR) * 8)
   const scalar_t* a_ld[NA];
@@ -318,23 +405,43 @@ __global__ void __launch_bounds__(kTileThreads) moe_tile_kernel(
     a_off[i] = row * kLds + (c % CPR) * 8;
     a_ld[i] = a_src + (int64_t)(pairs[a_ok[i] ? row : 0] / adiv) * Kd + (c % CPR) * 8;
   }
-  const scalar_t* g_ld[NB];
-  int b_off[NB];
+  int b_off[NB], b_row[NB], b_k[NB];
 #pragma unroll
   for (int i = 0; i < NB; ++i) {
     const int c = tid + i * kTileThreads, row = c / CPR;
     b_off[i] = row * kLds + (c % CPR) * 8;
-    g_ld[i] = w_e + (int64_t)min(n_base + row, N - 1) * Kd + (c % CPR) * 8;
+    b_row[i] = min(n_base + row, N - 1);
+    b_k[i] = (c % CPR) * 8;
   }
-  const int64_t up_stride = (int64_t)N * Kd;
   uint4 ra[NA], rg[NB], ru[NB];
+  // FP8: prefetch raw bytes + scales, dequantize when storing to shared memory
+  uint2 qg[NB], qu[NB];
+  float sg[NB], su[NB];
+  auto fetch_b = [&](int k) {
+#pragma unroll
+    for (int i = 0; i < NB; ++i) {
+      if constexpr (FP8) {
+        qg[i] = W.raw8(b_row[i], b_k[i] + k);
+        sg[i] = W.scale(b_row[i], b_k[i] + k);
+        if (GATED) qu[i] = W.raw8(N + b_row[i], b_k[i] + k), su[i] = W.scale(N + b_row[i], b_k[i] + k);
+      } else {
+        rg[i] = W.load8p(b_row[i], b_k[i] + k);
+        if (GATED) ru[i] = W.load8p(N + b_row[i], b_k[i] + k);
+      }
+    }
+  };
+  auto b_packed = [&](int i, bool up) -> uint4 {
+    if constexpr (FP8) {
+      float f[8];
+      fp8x8_to_float(up ? qu[i] : qg[i], up ? su[i] : sg[i], f);
+      return pack8<scalar_t>(f);
+    } else {
+      return up ? ru[i] : rg[i];
+    }
+  };
 #pragma unroll
   for (int i = 0; i < NA; ++i) ra[i] = a_ok[i] ? ld16(a_ld[i]) : zero;
-#pragma unroll
-  for (int i = 0; i < NB; ++i) {
-    rg[i] = ld16(g_ld[i]);
-    ru[i] = GATED ? ld16(g_ld[i] + up_stride) : zero;
-  }
+  fetch_b(0);
 
   const int wave = tid / kWarp;
   const int wr = (wave / WAVES_N) * WM, wc = (wave % WAVES_N) * WN;
@@ -346,18 +453,14 @@ __global__ void __launch_bounds__(kTileThreads) moe_tile_kernel(
       if (a_on[i]) *reinterpret_cast<uint4*>(&As[a_off[i]]) = ra[i];
 #pragma unroll
     for (int i = 0; i < NB; ++i) {
-      *reinterpret_cast<uint4*>(&Bg[b_off[i]]) = rg[i];
-      if (GATED) *reinterpret_cast<uint4*>(&Bu[b_off[i]]) = ru[i];
+      *reinterpret_cast<uint4*>(&Bg[b_off[i]]) = b_packed(i, false);
+      if (GATED) *reinterpret_cast<uint4*>(&Bu[b_off[i]]) = b_packed(i, true);
     }
     __syncthreads();
     if (k + BK < Kd) {
 #pragma unroll
       for (int i = 0; i < NA; ++i) ra[i] = a_ok[i] ? ld16(a_ld[i] + k + BK) : zero;
-#pragma unroll
-      for (int i = 0; i < NB; ++i) {
-        rg[i] = ld16(g_ld[i] + k + BK);
-        if (GATED) ru[i] = ld16(g_ld[i] + up_stride + k + BK);
-      }
+      fetch_b(k + BK);
     }
 #pragma unroll
     for (int kk = 0; kk < BK; kk += 32) {
@@ -495,8 +598,8 @@ __device__ __forceinline__ int block_rows(const int* __restrict__ perm, const in
 // ---------------------------------------------------------------------------------------------
 // 2. gate/up + silu. grid (max_blocks, ceil(I / cols)); each group of LANES lanes owns a column.
 // ---------------------------------------------------------------------------------------------
-template <typename scalar_t, int M, int LANES, int COLS>
-__device__ __forceinline__ void gate_up_cols(const scalar_t* xs, const scalar_t* __restrict__ wg_e,
+template <typename scalar_t, bool FP8, int M, int LANES, int COLS>
+__device__ __forceinline__ void gate_up_cols(const scalar_t* xs, const WExp<scalar_t, FP8>& wgu,
                                              scalar_t* __restrict__ act, const int* pairs, int m,
                                              int H, int I, int c0, int c1, int act_fn) {
   // Each group of LANES lanes computes COLS adjacent output columns at once, so every activation
@@ -505,25 +608,42 @@ __device__ __forceinline__ void gate_up_cols(const scalar_t* xs, const scalar_t*
   const int ngroups = blockDim.x / LANES;
   const int vecs = H / 8;
   for (int cb = c0 + group * COLS; cb < c1; cb += ngroups * COLS) {
-    const scalar_t* wg[COLS];
-    const scalar_t* wu[COLS];
+    int rgate[COLS];
 #pragma unroll
-    for (int j = 0; j < COLS; ++j) {
-      const int c = min(cb + j, c1 - 1);
-      wg[j] = wg_e + (int64_t)c * H;
-      wu[j] = wg[j] + (int64_t)I * H;
-    }
+    for (int j = 0; j < COLS; ++j) rgate[j] = min(cb + j, c1 - 1);
     float ag[COLS][M], au[COLS][M];
 #pragma unroll
     for (int j = 0; j < COLS; ++j)
 #pragma unroll
       for (int r = 0; r < M; ++r) ag[j][r] = 0.f, au[j][r] = 0.f;
+    if constexpr (FP8) {
+      // 16 weights per 16-byte load, scale applied once per chunk
+      for (int v = lane; v < H / 16; v += LANES) {
+        float g16[COLS][16], u16[COLS][16], sg[COLS], su[COLS];
+#pragma unroll
+        for (int j = 0; j < COLS; ++j) {
+          sg[j] = wgu.load16u(rgate[j], v * 16, g16[j]);
+          su[j] = wgu.load16u(I + rgate[j], v * 16, u16[j]);
+        }
+#pragma unroll
+        for (int r = 0; r < M; ++r) {
+          float xa[8], xb[8];
+          load8(xs + r * H + v * 16, xa);
+          load8(xs + r * H + v * 16 + 8, xb);
+#pragma unroll
+          for (int j = 0; j < COLS; ++j) {
+            ag[j][r] = fmaf(sg[j], dot8(g16[j], xa) + dot8(g16[j] + 8, xb), ag[j][r]);
+            au[j][r] = fmaf(su[j], dot8(u16[j], xa) + dot8(u16[j] + 8, xb), au[j][r]);
+          }
+        }
+      }
+    } else {
     for (int v = lane; v < vecs; v += LANES) {
       float g8[COLS][8], u8[COLS][8];
 #pragma unroll
       for (int j = 0; j < COLS; ++j) {
-        load8(wg[j] + v * 8, g8[j]);
-        load8(wu[j] + v * 8, u8[j]);
+        wgu.load8f(rgate[j], v * 8, g8[j]);
+        wgu.load8f(I + rgate[j], v * 8, u8[j]);
       }
 #pragma unroll
       for (int r = 0; r < M; ++r) {
@@ -535,6 +655,7 @@ __device__ __forceinline__ void gate_up_cols(const scalar_t* xs, const scalar_t*
           au[j][r] += dot8(u8[j], x8);
         }
       }
+    }
     }
 #pragma unroll
     for (int j = 0; j < COLS; ++j)
@@ -548,9 +669,9 @@ __device__ __forceinline__ void gate_up_cols(const scalar_t* xs, const scalar_t*
   }
 }
 
-template <typename scalar_t, int LANES, int CW>
+template <typename scalar_t, bool FP8, int LANES, int CW>
 __global__ void __launch_bounds__(kMaxThreads) gate_up_silu_kernel(
-    const scalar_t* __restrict__ x, const scalar_t* __restrict__ w, scalar_t* __restrict__ act,
+    const scalar_t* __restrict__ x, const WSrc w, scalar_t* __restrict__ act,
     const int* __restrict__ perm, const int* __restrict__ blk_expert, const int* __restrict__ blk_row,
     const int* __restrict__ blk_end, int H, int I, int topk, int E, int bm, int cols, int mfma_min,
     int act_fn) {
@@ -569,40 +690,55 @@ __global__ void __launch_bounds__(kMaxThreads) gate_up_silu_kernel(
   stage_rows(xs, x, toks, m, bm, H);
   __syncthreads();
   const int c0 = blockIdx.y * cols, c1 = min(I, c0 + cols);
-  const scalar_t* wg_e = w + (int64_t)e * 2 * I * H;
+  const auto wg_e = expert_w<scalar_t, FP8>(w, e, 2 * I, H);
   if (m >= mfma_min && H % 32 == 0) {
-    gate_up_mma<scalar_t>(xs, wg_e, act, pairs, m, H, I, c0, c1, act_fn);
+    gate_up_mma<scalar_t, FP8>(xs, wg_e, act, pairs, m, H, I, c0, c1, act_fn);
     return;
   }
-  if (m == 1)      gate_up_cols<scalar_t, 1, LANES, 1>(xs, wg_e, act, pairs, m, H, I, c0, c1, act_fn);
-  else if (m == 2) gate_up_cols<scalar_t, 2, LANES, CW>(xs, wg_e, act, pairs, m, H, I, c0, c1, act_fn);
-  else if (m <= 4) gate_up_cols<scalar_t, 4, LANES, CW>(xs, wg_e, act, pairs, m, H, I, c0, c1, act_fn);
-  else             gate_up_cols<scalar_t, kMaxM, LANES, CW>(xs, wg_e, act, pairs, m, H, I, c0, c1, act_fn);
+  if (m == 1)      gate_up_cols<scalar_t, FP8, 1, LANES, 1>(xs, wg_e, act, pairs, m, H, I, c0, c1, act_fn);
+  else if (m == 2) gate_up_cols<scalar_t, FP8, 2, LANES, CW>(xs, wg_e, act, pairs, m, H, I, c0, c1, act_fn);
+  else if (m <= 4) gate_up_cols<scalar_t, FP8, 4, LANES, CW>(xs, wg_e, act, pairs, m, H, I, c0, c1, act_fn);
+  else             gate_up_cols<scalar_t, FP8, kMaxM, LANES, CW>(xs, wg_e, act, pairs, m, H, I, c0, c1, act_fn);
 }
 
 // ---------------------------------------------------------------------------------------------
 // 3. down projection * routing weight. grid (max_blocks, ceil(H / cols)).
 // ---------------------------------------------------------------------------------------------
-template <typename scalar_t, int M, int LANES, int COLS>
-__device__ __forceinline__ void down_cols(const scalar_t* as, const scalar_t* __restrict__ wd_e,
+template <typename scalar_t, bool FP8, int M, int LANES, int COLS>
+__device__ __forceinline__ void down_cols(const scalar_t* as, const WExp<scalar_t, FP8>& wde,
                                           const scalar_t* __restrict__ rw, scalar_t* __restrict__ y,
                                           const int* pairs, int m, int H, int I, int c0, int c1) {
   const int group = threadIdx.x / LANES, lane = threadIdx.x % LANES;
   const int ngroups = blockDim.x / LANES;
   const int vecs = I / 8;
   for (int cb = c0 + group * COLS; cb < c1; cb += ngroups * COLS) {
-    const scalar_t* wd[COLS];
+    int rrow[COLS];
 #pragma unroll
-    for (int j = 0; j < COLS; ++j) wd[j] = wd_e + (int64_t)min(cb + j, c1 - 1) * I;
+    for (int j = 0; j < COLS; ++j) rrow[j] = min(cb + j, c1 - 1);
     float acc[COLS][M];
 #pragma unroll
     for (int j = 0; j < COLS; ++j)
 #pragma unroll
       for (int r = 0; r < M; ++r) acc[j][r] = 0.f;
+    if constexpr (FP8) {
+      for (int v = lane; v < I / 16; v += LANES) {
+        float w16[COLS][16], sw[COLS];
+#pragma unroll
+        for (int j = 0; j < COLS; ++j) sw[j] = wde.load16u(rrow[j], v * 16, w16[j]);
+#pragma unroll
+        for (int r = 0; r < M; ++r) {
+          float aa[8], ab[8];
+          load8(as + r * I + v * 16, aa);
+          load8(as + r * I + v * 16 + 8, ab);
+#pragma unroll
+          for (int j = 0; j < COLS; ++j) acc[j][r] = fmaf(sw[j], dot8(w16[j], aa) + dot8(w16[j] + 8, ab), acc[j][r]);
+        }
+      }
+    } else {
     for (int v = lane; v < vecs; v += LANES) {
       float w8[COLS][8];
 #pragma unroll
-      for (int j = 0; j < COLS; ++j) load8(wd[j] + v * 8, w8[j]);
+      for (int j = 0; j < COLS; ++j) wde.load8f(rrow[j], v * 8, w8[j]);
 #pragma unroll
       for (int r = 0; r < M; ++r) {
         float a8[8];
@@ -610,6 +746,7 @@ __device__ __forceinline__ void down_cols(const scalar_t* as, const scalar_t* __
 #pragma unroll
         for (int j = 0; j < COLS; ++j) acc[j][r] += dot8(w8[j], a8);
       }
+    }
     }
 #pragma unroll
     for (int j = 0; j < COLS; ++j)
@@ -624,9 +761,9 @@ __device__ __forceinline__ void down_cols(const scalar_t* as, const scalar_t* __
   }
 }
 
-template <typename scalar_t, int LANES, int CW>
+template <typename scalar_t, bool FP8, int LANES, int CW>
 __global__ void __launch_bounds__(kMaxThreads) down_kernel(
-    const scalar_t* __restrict__ act, const scalar_t* __restrict__ w, const scalar_t* __restrict__ rw,
+    const scalar_t* __restrict__ act, const WSrc w, const scalar_t* __restrict__ rw,
     scalar_t* __restrict__ y, const int* __restrict__ perm, const int* __restrict__ blk_expert,
     const int* __restrict__ blk_row, const int* __restrict__ blk_end, int H, int I, int E, int bm, int cols,
     int mfma_min) {
@@ -641,15 +778,15 @@ __global__ void __launch_bounds__(kMaxThreads) down_kernel(
   stage_rows(as, act, pairs, m, bm, I);
   __syncthreads();
   const int c0 = blockIdx.y * cols, c1 = min(H, c0 + cols);
-  const scalar_t* wd_e = w + (int64_t)e * H * I;
+  const auto wd_e = expert_w<scalar_t, FP8>(w, e, H, I);
   if (m >= mfma_min && I % 32 == 0) {
-    down_mma<scalar_t>(as, wd_e, rw, y, pairs, m, H, I, c0, c1);
+    down_mma<scalar_t, FP8>(as, wd_e, rw, y, pairs, m, H, I, c0, c1);
     return;
   }
-  if (m == 1)      down_cols<scalar_t, 1, LANES, 1>(as, wd_e, rw, y, pairs, m, H, I, c0, c1);
-  else if (m == 2) down_cols<scalar_t, 2, LANES, CW>(as, wd_e, rw, y, pairs, m, H, I, c0, c1);
-  else if (m <= 4) down_cols<scalar_t, 4, LANES, CW>(as, wd_e, rw, y, pairs, m, H, I, c0, c1);
-  else             down_cols<scalar_t, kMaxM, LANES, CW>(as, wd_e, rw, y, pairs, m, H, I, c0, c1);
+  if (m == 1)      down_cols<scalar_t, FP8, 1, LANES, 1>(as, wd_e, rw, y, pairs, m, H, I, c0, c1);
+  else if (m == 2) down_cols<scalar_t, FP8, 2, LANES, CW>(as, wd_e, rw, y, pairs, m, H, I, c0, c1);
+  else if (m <= 4) down_cols<scalar_t, FP8, 4, LANES, CW>(as, wd_e, rw, y, pairs, m, H, I, c0, c1);
+  else             down_cols<scalar_t, FP8, kMaxM, LANES, CW>(as, wd_e, rw, y, pairs, m, H, I, c0, c1);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -686,16 +823,16 @@ struct Launch {
   else if (cfg.cw == 2) YAMOE_CASE(kWarp, 2, M)                                  \
   else YAMOE_CASE(kWarp, 4, M)
 
-template <typename scalar_t>
-void launch_all(const torch::Tensor& x, const torch::Tensor& wgu, const torch::Tensor& wd, const torch::Tensor& rw,
+template <typename scalar_t, bool FP8>
+void launch_all(const torch::Tensor& x, const WSrc& wgu, const WSrc& wd, const torch::Tensor& rw,
                 torch::Tensor& act, torch::Tensor& y, torch::Tensor& out, const torch::Tensor& perm, const int* blk_expert,
                 const int* blk_row, const int* blk_end, int T, int H, int I, int K, int E, int max_blocks, int bm, Launch up,
                 Launch dn, cudaStream_t stream) {
   const dim3 grid_up(max_blocks, (I + up.cols - 1) / up.cols);
   const size_t smem_up = (size_t)bm * H * sizeof(scalar_t);
 #define YAMOE_UP(L)                                                                                          \
-  gate_up_silu_kernel<scalar_t, L, CWV><<<grid_up, up.threads, smem_up, stream>>>(                                \
-      x.data_ptr<scalar_t>(), wgu.data_ptr<scalar_t>(), act.data_ptr<scalar_t>(), perm.data_ptr<int>(),      \
+  gate_up_silu_kernel<scalar_t, FP8, L, CWV><<<grid_up, up.threads, smem_up, stream>>>(                           \
+      x.data_ptr<scalar_t>(), wgu, act.data_ptr<scalar_t>(), perm.data_ptr<int>(),                            \
       blk_expert, blk_row, blk_end, H, I, K, E, bm, up.cols, up.mfma_min, up.act)
   YAMOE_SWITCH(up, YAMOE_UP);
 #undef YAMOE_UP
@@ -703,8 +840,8 @@ void launch_all(const torch::Tensor& x, const torch::Tensor& wgu, const torch::T
   const dim3 grid_dn(max_blocks, (H + dn.cols - 1) / dn.cols);
   const size_t smem_dn = (size_t)bm * I * sizeof(scalar_t);
 #define YAMOE_DN(L)                                                                                          \
-  down_kernel<scalar_t, L, CWV><<<grid_dn, dn.threads, smem_dn, stream>>>(                                        \
-      act.data_ptr<scalar_t>(), wd.data_ptr<scalar_t>(), rw.data_ptr<scalar_t>(), y.data_ptr<scalar_t>(),    \
+  down_kernel<scalar_t, FP8, L, CWV><<<grid_dn, dn.threads, smem_dn, stream>>>(                                   \
+      act.data_ptr<scalar_t>(), wd, rw.data_ptr<scalar_t>(), y.data_ptr<scalar_t>(),                          \
       perm.data_ptr<int>(), blk_expert, blk_row, blk_end, H, I, E, bm, dn.cols, dn.mfma_min)
   YAMOE_SWITCH(dn, YAMOE_DN);
 #undef YAMOE_DN
@@ -723,12 +860,17 @@ torch::Tensor fused_experts(torch::Tensor const& hidden_states,  // [T, H]
                             torch::Tensor const& down_proj,      // [E, H, I]
                             int64_t threads_up, int64_t cols_up, int64_t lanes_up, int64_t cw_up, int64_t threads_down,
                             int64_t cols_down, int64_t lanes_down, int64_t cw_down, int64_t mfma_min,
-                            double tile_min_rows, double tile16_max_rows, int64_t act_kind) {
+                            double tile_min_rows, double tile16_max_rows, int64_t act_kind,
+                            c10::optional<torch::Tensor> const& gate_up_scale,  // FP8: [E, ceil(2I / bn), ceil(H / bk)]
+                            c10::optional<torch::Tensor> const& down_scale,     // FP8: [E, ceil(H / bn), ceil(I / bk)]
+                            int64_t block_n, int64_t block_k) {
   TORCH_CHECK(hidden_states.is_cuda() && hidden_states.dim() == 2, "hidden_states must be a 2D GPU tensor");
   TORCH_CHECK(gate_up_proj.dim() == 3 && down_proj.dim() == 3, "expert weights must be 3D");
-  TORCH_CHECK(hidden_states.scalar_type() == gate_up_proj.scalar_type() &&
-                  hidden_states.scalar_type() == down_proj.scalar_type(),
-              "hidden_states and expert weights must share a dtype");
+  // Weights are either the activation dtype or FP8 e4m3fn with fp32 block scales (weight-only dequant).
+  const bool fp8 = gate_up_proj.scalar_type() == at::kFloat8_e4m3fn;
+  TORCH_CHECK(down_proj.scalar_type() == gate_up_proj.scalar_type(), "gate_up_proj and down_proj must share a dtype");
+  TORCH_CHECK(fp8 || hidden_states.scalar_type() == gate_up_proj.scalar_type(),
+              "expert weights must match hidden_states dtype or be float8_e4m3fn");
   const int T = hidden_states.size(0), H = hidden_states.size(1);
   const int K = top_k_index.size(1);
   const int E = gate_up_proj.size(0), I = gate_up_proj.size(1) / 2;
@@ -746,6 +888,19 @@ torch::Tensor fused_experts(torch::Tensor const& hidden_states,  // [T, H]
   for (int64_t l : {lanes_up, lanes_down})
     TORCH_CHECK(l == 8 || l == 16 || l == 32 || l == kWarp, "lanes per column must be 8, 16, 32 or the warp size");
   TORCH_CHECK(threads_up <= kMaxThreads && threads_down <= kMaxThreads, "too many threads");
+  if (fp8) {
+    TORCH_CHECK(gate_up_scale.has_value() && down_scale.has_value(), "FP8 weights need gate_up_scale and down_scale");
+    TORCH_CHECK(block_n > 0 && block_k > 0 && block_k % 16 == 0, "FP8 block_k must be a positive multiple of 16");
+    TORCH_CHECK(H % 16 == 0 && I % 16 == 0, "FP8 weights need H and I to be multiples of 16");
+    const auto& gs = *gate_up_scale;
+    const auto& ds = *down_scale;
+    auto cdiv = [](int64_t a, int64_t b) { return (a + b - 1) / b; };
+    TORCH_CHECK(gs.scalar_type() == at::kFloat && ds.scalar_type() == at::kFloat, "FP8 scales must be float32");
+    TORCH_CHECK(gs.dim() == 3 && gs.size(0) == E && gs.size(1) == cdiv(2 * I, block_n) && gs.size(2) == cdiv(H, block_k),
+                "gate_up_scale must be [E, ceil(2I / block_n), ceil(H / block_k)]");
+    TORCH_CHECK(ds.dim() == 3 && ds.size(0) == E && ds.size(1) == cdiv(H, block_n) && ds.size(2) == cdiv(I, block_k),
+                "down_scale must be [E, ceil(H / block_n), ceil(I / block_k)]");
+  }
 
   const c10::cuda::CUDAGuard guard(hidden_states.device());
   auto stream = at::cuda::getCurrentCUDAStream();
@@ -754,6 +909,12 @@ torch::Tensor fused_experts(torch::Tensor const& hidden_states,  // [T, H]
   auto wd = down_proj.contiguous();
   auto ids = top_k_index.reshape({-1}).to(torch::kInt64).contiguous();
   auto rw = top_k_weights.reshape({-1}).to(x.scalar_type()).contiguous();
+  torch::Tensor gs_c, ds_c;
+  if (fp8) gs_c = gate_up_scale->contiguous(), ds_c = down_scale->contiguous();
+  const WSrc src_gu{wgu.data_ptr(), fp8 ? gs_c.data_ptr<float>() : nullptr, fp8 ? (int)gs_c.size(1) : 0,
+                    fp8 ? (int)gs_c.size(2) : 0, (int)block_n, (int)block_k};
+  const WSrc src_dn{wd.data_ptr(), fp8 ? ds_c.data_ptr<float>() : nullptr, fp8 ? (int)ds_c.size(1) : 0,
+                    fp8 ? (int)ds_c.size(2) : 0, (int)block_n, (int)block_k};
 
   const int S = T * K;
   // Matrix-core paths need MFMA (ROCm) or mma.sync bf16 / f16 (sm80+).
@@ -780,18 +941,19 @@ torch::Tensor fused_experts(torch::Tensor const& hidden_states,  // [T, H]
     auto y_t = torch::empty({S, H}, x.options());
     auto out_t = torch::empty({T, H}, x.options());
     const int64_t n = (int64_t)T * H;
-    auto run = [&](auto tag) {
+    auto run = [&](auto tag, auto fp8_tag) {
       using scalar_t = decltype(tag);
+      constexpr bool FP8V = decltype(fp8_tag)::value;
       auto launch = [&](auto tm_tag, auto bk_tag) {
         constexpr int TMV = decltype(tm_tag)::value;
         constexpr int BKV = decltype(bk_tag)::value;
         constexpr int TN = tile_n<TMV>();
         const dim3 grid_up(tb, (I + TN - 1) / TN), grid_dn(tb, (H + TN - 1) / TN);
-        moe_tile_kernel<scalar_t, true, TMV, BKV><<<grid_up, kTileThreads, 0, stream>>>(
-            x.data_ptr<scalar_t>(), wgu.data_ptr<scalar_t>(), act_t.data_ptr<scalar_t>(), nullptr,
+        moe_tile_kernel<scalar_t, FP8V, true, TMV, BKV><<<grid_up, kTileThreads, 0, stream>>>(
+            x.data_ptr<scalar_t>(), src_gu, act_t.data_ptr<scalar_t>(), nullptr,
             perm_t.data_ptr<int>(), be, br, bn, I, H, K, E, (int)act_kind);
-        moe_tile_kernel<scalar_t, false, TMV, BKV><<<grid_dn, kTileThreads, 0, stream>>>(
-            act_t.data_ptr<scalar_t>(), wd.data_ptr<scalar_t>(), y_t.data_ptr<scalar_t>(), rw.data_ptr<scalar_t>(),
+        moe_tile_kernel<scalar_t, FP8V, false, TMV, BKV><<<grid_dn, kTileThreads, 0, stream>>>(
+            act_t.data_ptr<scalar_t>(), src_dn, y_t.data_ptr<scalar_t>(), rw.data_ptr<scalar_t>(),
             perm_t.data_ptr<int>(), be, br, bn, H, I, 1, E, (int)act_kind);
       };
       if (tm == 16 && H % 64 == 0 && I % 64 == 0) launch(std::integral_constant<int, 16>{}, std::integral_constant<int, 64>{});
@@ -800,8 +962,10 @@ torch::Tensor fused_experts(torch::Tensor const& hidden_states,  // [T, H]
       topk_sum_kernel<scalar_t><<<(n + 255) / 256, 256, 0, stream>>>(y_t.data_ptr<scalar_t>(),
                                                                     out_t.data_ptr<scalar_t>(), T, K, H);
     };
-    if (x.scalar_type() == at::kBFloat16) run(at::BFloat16{});
-    else if (x.scalar_type() == at::kHalf) run(at::Half{});
+    using T8 = std::integral_constant<bool, true>;
+    using T16 = std::integral_constant<bool, false>;
+    if (x.scalar_type() == at::kBFloat16) fp8 ? run(at::BFloat16{}, T8{}) : run(at::BFloat16{}, T16{});
+    else if (x.scalar_type() == at::kHalf) fp8 ? run(at::Half{}, T8{}) : run(at::Half{}, T16{});
     else TORCH_CHECK(false, "fused_experts supports bfloat16 and float16");
     return out_t;
   }
@@ -822,14 +986,16 @@ torch::Tensor fused_experts(torch::Tensor const& hidden_states,  // [T, H]
   const Launch up{(int)threads_up, (int)cols_up, (int)lanes_up, (int)cw_up, (int)mfma_min, (int)act_kind};
   const Launch dn{(int)threads_down, (int)cols_down, (int)lanes_down, (int)cw_down, (int)mfma_min, (int)act_kind};
 
+#define YAMOE_ALL(ST, F8)                                                                                     \
+  launch_all<ST, F8>(x, src_gu, src_dn, rw, act, y, out, perm, blk_expert, blk_row, blk_end, T, H, I, K, E,     \
+                     max_blocks, bm, up, dn, stream)
   if (x.scalar_type() == at::kBFloat16) {
-    launch_all<at::BFloat16>(x, wgu, wd, rw, act, y, out, perm, blk_expert, blk_row, blk_end, T, H, I, K, E,
-                             max_blocks, bm, up, dn, stream);
+    if (fp8) YAMOE_ALL(at::BFloat16, true); else YAMOE_ALL(at::BFloat16, false);
   } else if (x.scalar_type() == at::kHalf) {
-    launch_all<at::Half>(x, wgu, wd, rw, act, y, out, perm, blk_expert, blk_row, blk_end, T, H, I, K, E,
-                         max_blocks, bm, up, dn, stream);
+    if (fp8) YAMOE_ALL(at::Half, true); else YAMOE_ALL(at::Half, false);
   } else {
     TORCH_CHECK(false, "fused_experts supports bfloat16 and float16");
   }
+#undef YAMOE_ALL
   return out;
 }

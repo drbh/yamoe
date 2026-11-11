@@ -1,12 +1,13 @@
 """Experts forward for the transformers experts layout, on CUDA and ROCm.
 
-`fused_experts` is the functional entry point (gate activation SiLU or GELU tanh). `experts_forward` matches the transformers
-`ExpertsInterface` signature, so it can be registered as an experts implementation:
+`fused_experts` is the functional entry point (gate activation SiLU or GELU tanh, bf16 / f16 or FP8 block-scaled
+weights). `experts_forward` and `fp8_experts_forward` match the transformers experts interfaces:
 
-    from transformers.integrations.moe import ALL_EXPERTS_FUNCTIONS
-    ALL_EXPERTS_FUNCTIONS.register("yamoe", yamoe.experts_forward)
+    yamoe.register()  # registers "yamoe" for bf16 / f16 experts and fine-grained FP8 experts
     model = AutoModelForCausalLM.from_pretrained(..., experts_implementation="yamoe")
 """
+
+from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
@@ -90,11 +91,12 @@ def _use_kernel(num_pairs: int, num_experts: int) -> bool:
     return num_pairs <= d["grouped_mm_min_rows"] * num_experts
 
 
-def _kernel(hidden_states, top_k_index, top_k_weights, gate_up_proj, down_proj, act: int = 0):
+def _kernel(hidden_states, top_k_index, top_k_weights, gate_up_proj, down_proj, act: int = 0, scales=None):
     d = DEFAULTS
+    gs, ds, bn, bk = scales if scales is not None else (None, None, 128, 128)
     return ops.fused_experts(
         hidden_states, top_k_index, top_k_weights.to(hidden_states.dtype), gate_up_proj, down_proj, *d["cfg"],
-        d["mfma_min"], d["tile_min_rows"], d["tile16_max_rows"], act,
+        d["mfma_min"], d["tile_min_rows"], d["tile16_max_rows"], act, gs, ds, bn, bk,
     )
 
 
@@ -105,9 +107,18 @@ def fused_experts(
     gate_up_proj: torch.Tensor,  # [E, 2I, H], rows [0, I) gate, [I, 2I) up
     down_proj: torch.Tensor,  # [E, H, I]
     activation: str = "silu",
+    gate_up_scale: torch.Tensor | None = None,  # FP8 weights: [E, ceil(2I / bn), ceil(H / bk)] fp32
+    down_scale: torch.Tensor | None = None,  # FP8 weights: [E, ceil(H / bn), ceil(I / bk)] fp32
+    block_size: tuple[int, int] = (128, 128),
 ) -> torch.Tensor:
-    """Gated experts: sum_k w[t, k] * down[e](act(gate[e] x) * up[e] x), no bias. act: silu or gelu_pytorch_tanh."""
+    """Gated experts: sum_k w[t, k] * down[e](act(gate[e] x) * up[e] x), no bias. act: silu or gelu_pytorch_tanh.
+
+    Weights are the activation dtype, or float8_e4m3fn with fp32 block scales (dequantized in the kernel).
+    """
     act = ACTIVATIONS[activation]
+    if gate_up_proj.dtype == torch.float8_e4m3fn:
+        return _kernel(hidden_states, top_k_index, top_k_weights, gate_up_proj, down_proj, act,
+                       (gate_up_scale, down_scale, block_size[0], block_size[1]))
     if _use_kernel(top_k_index.numel(), gate_up_proj.shape[0]):
         return _kernel(hidden_states, top_k_index, top_k_weights, gate_up_proj, down_proj, act)
     return _grouped_mm_experts(hidden_states, top_k_index, top_k_weights.to(hidden_states.dtype), gate_up_proj, down_proj, act)
@@ -152,3 +163,80 @@ def experts_forward(module, hidden_states, top_k_index, top_k_weights):
     from transformers.integrations.moe import grouped_mm_experts_forward
 
     return grouped_mm_experts_forward(module, hidden_states, top_k_index, top_k_weights)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Fine-grained FP8 experts (transformers `FP8Experts`, e.g. Qwen3.6-35B-A3B-FP8): weight-only dequant in the kernel.
+# ROCm: the kernel wins at every size (MI300X: 2-7x over the Triton FP8 paths). Hopper / Blackwell: native FP8 tensor
+# cores in finegrained-fp8 win past small decode batches (also on Ada), so we hand off to transformers' FP8 forwards.
+# ---------------------------------------------------------------------------------------------------------------------
+def _fp8_kernel_max_pairs():
+    # ROCm: always (MI300X Qwen3-30B-A3B-FP8: 1.7-4.7x decode, 1.2-1.7x prefill over the transformers FP8 paths).
+    # CUDA: single-token decode only; on B200 / RTX 4090 finegrained-fp8's FP8 tensor-core paths are as fast or faster
+    # from a few tokens up.
+    return None if IS_ROCM else 8
+
+
+FP8_KERNEL_MAX_PAIRS = _fp8_kernel_max_pairs()
+
+
+def _fp8_supported(module, hidden_states) -> bool:
+    bs = getattr(module, "block_size", None)
+    if not (
+        getattr(module, "has_gate", False)
+        and not getattr(module, "has_bias", True)
+        and not getattr(module, "is_transposed", False)
+        and getattr(module, "is_concatenated", True)
+        and not getattr(module, "_is_expert_parallel", False)
+        and getattr(module, "activation_scheme", None) == "dynamic"
+        and getattr(module, "swiglu_alpha", None) is None
+        and getattr(module, "limit", None) is None
+        and bs is not None
+        and len(bs) == 2
+        and bs[1] % 16 == 0
+        and _activation(module) in ACTIVATIONS
+        and hidden_states.dtype in (torch.bfloat16, torch.float16)
+        and getattr(module, "gate_up_proj", None) is not None
+        and module.gate_up_proj.dtype == torch.float8_e4m3fn
+        and module.gate_up_proj_scale_inv.dtype == torch.float32
+        and module.down_proj_scale_inv.dtype == torch.float32
+    ):
+        return False
+    E, N2, H = module.gate_up_proj.shape
+    I = module.down_proj.shape[2]
+    cdiv = lambda a, b: (a + b - 1) // b  # noqa: E731
+    return (
+        H % 16 == 0
+        and I % 16 == 0
+        and tuple(module.gate_up_proj_scale_inv.shape) == (E, cdiv(N2, bs[0]), cdiv(H, bs[1]))
+        and tuple(module.down_proj_scale_inv.shape) == (E, cdiv(H, bs[0]), cdiv(I, bs[1]))
+    )
+
+
+def fp8_experts_forward(module, hidden_states, top_k_index, top_k_weights):
+    """transformers `FP8ExpertsInterface` forward for fine-grained FP8 experts."""
+    S = top_k_index.numel()
+    if _fp8_supported(module, hidden_states) and (FP8_KERNEL_MAX_PAIRS is None or S <= FP8_KERNEL_MAX_PAIRS):
+        bs = module.block_size
+        return _kernel(
+            hidden_states, top_k_index, top_k_weights, module.gate_up_proj, module.down_proj,
+            ACTIVATIONS[_activation(module)],
+            (module.gate_up_proj_scale_inv, module.down_proj_scale_inv, int(bs[0]), int(bs[1])),
+        )
+    from transformers.integrations.finegrained_fp8 import fp8_batched_mm_experts_forward, fp8_grouped_mm_experts_forward
+
+    if S <= 128 and getattr(module, "activation_scheme", "dynamic") == "dynamic":
+        return fp8_batched_mm_experts_forward(module, hidden_states, top_k_index, top_k_weights)
+    return fp8_grouped_mm_experts_forward(module, hidden_states, top_k_index, top_k_weights)
+
+
+def register(name: str = "yamoe") -> None:
+    """Register yamoe as experts implementation `name` for bf16 / f16 and fine-grained FP8 experts in transformers."""
+    from transformers.integrations.moe import ALL_EXPERTS_FUNCTIONS
+
+    ALL_EXPERTS_FUNCTIONS.register(name, experts_forward)
+    try:
+        from transformers.integrations.finegrained_fp8 import ALL_FP8_EXPERTS_FUNCTIONS
+    except ImportError:
+        return
+    ALL_FP8_EXPERTS_FUNCTIONS.register(name, fp8_experts_forward)

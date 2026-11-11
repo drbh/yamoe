@@ -1,7 +1,7 @@
 import torch
 
 from ._ops import ops
-from .experts import experts_forward, fused_experts
+from .experts import experts_forward, fp8_experts_forward, fused_experts, register
 from .vendored import gpt_oss_mlp, yamoe_ref
 
 __all__ = [
@@ -9,7 +9,9 @@ __all__ = [
     "ops",
     # transformers experts layout (CUDA and ROCm)
     "experts_forward",
+    "fp8_experts_forward",
     "fused_experts",
+    "register",
     # Vendored reference implementations
     "yamoe_ref",
     "gpt_oss_mlp",
