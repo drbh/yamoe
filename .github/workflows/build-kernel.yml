@@ -6,6 +6,7 @@ on:
     paths:
       - "csrc/**"
       - "torch-ext/**"
+      - build.toml
       - flake.nix
       - flake.lock
       - .github/workflows/build-kernel.yml

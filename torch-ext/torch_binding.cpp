@@ -6,6 +6,17 @@
 TORCH_LIBRARY_EXPAND(
     TORCH_EXTENSION_NAME,
     ops) {
+  ops.def("fused_experts("
+          "Tensor hidden_states, "
+          "Tensor top_k_index, "
+          "Tensor top_k_weights, "
+          "Tensor gate_up_proj, "
+          "Tensor down_proj, "
+          "int threads_up=1024, int cols_up=64, int lanes_up=16, int cw_up=1, "
+          "int threads_down=1024, int cols_down=64, int lanes_down=16, int cw_down=1, int mfma_min=5, float tile_min_rows=4, float tile16_max_rows=24, int act_kind=0, Tensor? gate_up_scale=None, Tensor? down_scale=None, int block_n=128, int block_k=128) -> Tensor");
+  ops.impl("fused_experts", torch::kCUDA, &fused_experts);
+
+#ifndef USE_ROCM
   ops.def("gather("
           "Tensor x, "
           "Tensor indices, "
@@ -106,6 +117,7 @@ TORCH_LIBRARY_EXPAND(
           "int num_experts, "
           "int top_k) -> Tensor[]");
   ops.impl("experts_backward", torch::kCUDA, &experts_backward_cuda);
+#endif // USE_ROCM
 }
 
 REGISTER_EXTENSION(
