@@ -1,8 +1,12 @@
 [general]
 name = "yamoe"
-backends = ["cuda"]
-version = 1
+version = 2
+edition = 6
 license = "MIT"
+backends = [
+    "cuda",
+    "rocm",
+]
 
 [general.hub]
 repo-id = "drbh/yamoe"
@@ -14,7 +18,7 @@ src = [
 ]
 
 [kernel.yamoe]
-backend = "cuda"
+language = "cpp-cuda"
 cuda-capabilities = [
     "8.0",
     "8.6",
@@ -40,3 +44,20 @@ src = [
     "csrc/experts_gather.cu",
     "csrc/experts_backward.cu",
 ]
+
+# Decode-path experts forward, one source for CUDA and ROCm (hipified by the builder).
+[kernel.fused_experts]
+language = "cpp-cuda"
+depends = ["torch"]
+src = ["csrc/fused_experts.cu"]
+
+[kernel.fused_experts_rocm]
+language = "cpp-rocm"
+depends = ["torch"]
+# wave64 (CDNA) only: the kernel assumes 64-wide wavefronts on AMD
+rocm-archs = [
+    "gfx90a",
+    "gfx942",
+    "gfx950",
+]
+src = ["csrc/fused_experts.cu"]

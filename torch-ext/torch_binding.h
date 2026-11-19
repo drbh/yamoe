@@ -2,6 +2,22 @@
 
 #include <torch/torch.h>
 
+// Small-token-count (decode) experts forward, transformers experts layout. CUDA and ROCm.
+torch::Tensor fused_experts(torch::Tensor const &hidden_states, // [T, H]
+                            torch::Tensor const &top_k_index,   // [T, K]
+                            torch::Tensor const &top_k_weights, // [T, K]
+                            torch::Tensor const &gate_up_proj,  // [E, 2I, H]
+                            torch::Tensor const &down_proj,     // [E, H, I]
+                            int64_t threads_up, int64_t cols_up, int64_t lanes_up,
+                            int64_t cw_up, int64_t threads_down, int64_t cols_down,
+                            int64_t lanes_down, int64_t cw_down, int64_t mfma_min,
+                            double tile_min_rows, double tile16_max_rows,
+                            int64_t act_kind, c10::optional<torch::Tensor> const &gate_up_scale,
+                            c10::optional<torch::Tensor> const &down_scale, int64_t block_n, int64_t block_k);
+
+#ifndef USE_ROCM
+// The ops below use cuBLAS / CUTLASS and are CUDA only.
+
 void gather_cuda(torch::Tensor const &x,
                  torch::Tensor const &indices,
                  torch::Tensor const &bins,
@@ -99,3 +115,5 @@ std::vector<torch::Tensor> experts_backward_cuda(
     int64_t num_experts,                 // E - number of experts
     int64_t top_k                        // K - top-k routing
 );
+
+#endif // USE_ROCM
